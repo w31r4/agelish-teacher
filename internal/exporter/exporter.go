@@ -3,17 +3,21 @@ package exporter
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/zenfun/agelish-teacher/internal/httpraw"
 	"github.com/zenfun/agelish-teacher/internal/otel"
 	"github.com/zenfun/agelish-teacher/internal/provider"
 	_ "modernc.org/sqlite"
@@ -42,6 +46,11 @@ type RawPairOptions struct {
 	ResponseBody []byte
 	StartedAt    time.Time
 	EndedAt      time.Time
+}
+
+type RawEnvelopeOptions struct {
+	Envelopes []httpraw.Envelope
+	InputKind string
 }
 
 type sessionRow struct {
@@ -142,204 +151,485 @@ func ExportRawPair(opts RawPairOptions) (Result, error) {
 	if endedAt.IsZero() || endedAt.Before(startedAt) {
 		endedAt = startedAt
 	}
-	startMS := startedAt.UnixMilli()
-	endMS := endedAt.UnixMilli()
-
-	parsedRequest, _ := provider.ParseRequest(providerName, opts.RequestBody)
-	parsedResponse, _ := provider.ParseResponse(providerName, opts.ResponseBody)
-	toolResultsByID := map[string]provider.ToolResult{}
-	for _, result := range parsedRequest.ToolResults {
-		if result.ID != "" {
-			toolResultsByID[result.ID] = result
-		}
-	}
-
-	traceID := otel.DeriveTraceID("raw-session:" + sessionID)
-	rootSpanID := otel.DeriveSpanID("raw-session:" + sessionID)
-	turnSpanID := otel.DeriveSpanID("raw-turn:" + sessionID + ":1")
-	rawSession := sessionRow{ID: sessionID, Source: source}
-	rootName := sessionSpanName(rawSession)
-	rootAttrs := map[string]any{
-		"scribe.session.id":         sessionID,
-		"scribe.source":             source,
-		"gen_ai.conversation.id":    sessionID,
-		"session.id":                sessionID,
-		"langfuse.session.id":       sessionID,
-		"langfuse.observation.type": "span",
-		"langfuse.trace.name":       rootName,
-		"agelish.input.kind":        "raw_http_body",
-	}
-	turnAttrs := map[string]any{
-		"scribe.turn.id":            "raw_turn_1",
-		"scribe.turn.number":        int64(1),
-		"scribe.turn.status":        "completed",
-		"session.id":                sessionID,
-		"langfuse.session.id":       sessionID,
-		"gen_ai.conversation.id":    sessionID,
-		"langfuse.observation.type": "span",
-		"langfuse.trace.name":       rootName,
-		"agelish.input.kind":        "raw_http_body",
-	}
-	if len(parsedRequest.InputMessages) > 0 {
-		rootAttrs["langfuse.trace.input"] = parsedRequest.InputMessages
-		rootAttrs["langfuse.observation.input"] = parsedRequest.InputMessages
-		turnAttrs["langfuse.observation.input"] = parsedRequest.InputMessages
-	}
-	rawResponseIsError := parsedFinishReasonIsError(parsedResponse)
-	rawErrorType := "error"
-	if rawResponseIsError {
-		output := errorObservationOutput(traceRequestRow{}, rawErrorType, parsedResponse)
-		rootAttrs["langfuse.trace.output"] = output
-		rootAttrs["langfuse.observation.output"] = output
-		turnAttrs["langfuse.observation.output"] = output
-	} else if len(parsedResponse.OutputMessages) > 0 {
-		rootAttrs["langfuse.trace.output"] = parsedResponse.OutputMessages
-		rootAttrs["langfuse.observation.output"] = parsedResponse.OutputMessages
-		turnAttrs["langfuse.observation.output"] = parsedResponse.OutputMessages
-	}
-
-	spans := []otel.Span{
-		{
-			TraceID:       traceID,
-			SpanID:        rootSpanID,
-			Name:          rootName,
-			Kind:          "SPAN_KIND_INTERNAL",
-			StartUnixNano: msToNs(startMS),
-			EndUnixNano:   msToNs(endMS),
-			Attributes:    rootAttrs,
+	return ExportRawEnvelopes(RawEnvelopeOptions{
+		InputKind: "raw_http_body",
+		Envelopes: []httpraw.Envelope{
+			{
+				Source:      source,
+				Provider:    providerName,
+				SessionID:   sessionID,
+				TurnID:      "raw_turn_1",
+				RequestID:   requestID,
+				Direction:   "request",
+				BodyBase64:  base64Body(opts.RequestBody),
+				TimestampMS: startedAt.UnixMilli(),
+			},
+			{
+				Source:      source,
+				Provider:    providerName,
+				SessionID:   sessionID,
+				TurnID:      "raw_turn_1",
+				RequestID:   requestID,
+				Direction:   "response",
+				StatusCode:  int64Ptr(200),
+				BodyBase64:  base64Body(opts.ResponseBody),
+				TimestampMS: endedAt.UnixMilli(),
+			},
 		},
-		{
-			TraceID:       traceID,
-			SpanID:        turnSpanID,
-			ParentSpanID:  rootSpanID,
-			Name:          turnSpanName(source, 1),
-			Kind:          "SPAN_KIND_INTERNAL",
-			StartUnixNano: msToNs(startMS),
-			EndUnixNano:   msToNs(endMS),
-			Attributes:    turnAttrs,
-		},
-	}
+	})
+}
 
-	attrs := map[string]any{
-		"gen_ai.provider.name":       providerName,
-		"gen_ai.operation.name":      "chat",
-		"gen_ai.conversation.id":     sessionID,
-		"session.id":                 sessionID,
-		"langfuse.session.id":        sessionID,
-		"langfuse.observation.type":  "generation",
-		"langfuse.observation.level": langfuseLevel(rawGenerationOutcome(rawResponseIsError)),
-		"langfuse.trace.name":        rootName,
-		"scribe.trace_request.id":    requestID,
-		"scribe.request_id":          requestID,
-		"agelish.input.kind":         "raw_http_body",
+func ExportRawEnvelopes(opts RawEnvelopeOptions) (Result, error) {
+	if len(opts.Envelopes) == 0 {
+		return Result{}, fmt.Errorf("raw envelopes are required")
 	}
-	addInternalContextAttributes(attrs, parsedRequest.InternalContexts)
-	if parsedRequest.Model != "" {
-		attrs["gen_ai.request.model"] = parsedRequest.Model
+	inputKind := strings.TrimSpace(opts.InputKind)
+	if inputKind == "" {
+		inputKind = "raw_http_envelope"
 	}
-	if parsedResponse.Model != "" {
-		attrs["gen_ai.response.model"] = parsedResponse.Model
+	sessions, err := rawEnvelopeSessions(opts.Envelopes)
+	if err != nil {
+		return Result{}, err
 	}
-	setIntAttr(attrs, "gen_ai.usage.input_tokens", sql.NullInt64{}, parsedResponse.Usage.InputTokens)
-	setIntAttr(attrs, "gen_ai.usage.output_tokens", sql.NullInt64{}, parsedResponse.Usage.OutputTokens)
-	setIntAttr(attrs, "gen_ai.usage.cache_read.input_tokens", sql.NullInt64{}, parsedResponse.Usage.CacheReadTokens)
-	setIntAttr(attrs, "gen_ai.usage.cache_creation.input_tokens", sql.NullInt64{}, parsedResponse.Usage.CacheCreationTokens)
-	setIntAttr(attrs, "gen_ai.usage.reasoning.output_tokens", sql.NullInt64{}, parsedResponse.Usage.ReasoningTokens)
-	setIntAttr(attrs, "gen_ai.request.max_tokens", sql.NullInt64{}, parsedRequest.MaxTokens)
-	if len(parsedResponse.FinishReasons) > 0 {
-		attrs["gen_ai.response.finish_reasons"] = parsedResponse.FinishReasons
-	}
-	addSystemInstructionAttributes(attrs, parsedRequest)
-	if len(parsedRequest.InputMessages) > 0 {
-		attrs["gen_ai.input.messages"] = mustJSON(parsedRequest.InputMessages)
-		attrs["gen_ai.prompt"] = mustJSON(parsedRequest.InputMessages)
-		attrs["langfuse.observation.input"] = parsedRequest.InputMessages
-	}
-	if rawResponseIsError {
-		attrs["error.type"] = rawErrorType
-		if message := parsedResponseErrorMessage(parsedResponse); message != "" {
-			attrs["langfuse.observation.status_message"] = message
+	var result Result
+	for _, session := range sessions {
+		spans, err := exportRawEnvelopeSession(session, inputKind)
+		if err != nil {
+			return Result{}, err
 		}
-		attrs["langfuse.observation.output"] = errorObservationOutput(traceRequestRow{}, rawErrorType, parsedResponse)
-	} else if len(parsedResponse.OutputMessages) > 0 {
-		attrs["gen_ai.output.messages"] = mustJSON(parsedResponse.OutputMessages)
-		attrs["gen_ai.completion"] = mustJSON(parsedResponse.OutputMessages)
-		attrs["langfuse.observation.output"] = parsedResponse.OutputMessages
+		result.Spans = append(result.Spans, spans...)
 	}
-	status := otel.Status{Code: "STATUS_CODE_OK"}
-	if rawResponseIsError {
-		status = otel.Status{Code: "STATUS_CODE_ERROR", Message: parsedResponseErrorMessage(parsedResponse)}
+	return result, nil
+}
+
+type tracePayload struct {
+	Row  traceRequestRow
+	Body []byte
+}
+
+type rawEnvelopeSession struct {
+	row   sessionRow
+	turns []rawEnvelopeTurn
+}
+
+type rawEnvelopeTurn struct {
+	row      turnRow
+	payloads []tracePayload
+}
+
+func rawEnvelopeSessions(envelopes []httpraw.Envelope) ([]rawEnvelopeSession, error) {
+	type mutableTurn struct {
+		row      turnRow
+		payloads []tracePayload
+	}
+	type mutableSession struct {
+		row   sessionRow
+		turns map[string]*mutableTurn
 	}
 
-	nameModel := parsedResponse.Model
-	if nameModel == "" {
-		nameModel = parsedRequest.Model
+	sessionsByID := map[string]*mutableSession{}
+	pendingByTurn := map[string][]string{}
+	providerByPair := map[string]string{}
+	fallbackRequestSeq := 0
+	for index, envelope := range envelopes {
+		direction := envelope.NormalizedDirection()
+		if direction != "request" && direction != "response" {
+			return nil, fmt.Errorf("raw envelope %d has unsupported direction %q", index+1, direction)
+		}
+		body, err := envelope.BodyBytes()
+		if err != nil {
+			return nil, fmt.Errorf("raw envelope %d body: %w", index+1, err)
+		}
+		providerName := rawEnvelopeProvider(envelope)
+		source := strings.TrimSpace(envelope.Source)
+		if source == "" {
+			source = providerName
+		}
+		if source == "" || source == "unknown" {
+			source = "raw-http"
+		}
+		sessionID := strings.TrimSpace(envelope.SessionID)
+		if sessionID == "" {
+			sessionID = "raw_" + source
+		}
+		turnID := strings.TrimSpace(envelope.TurnID)
+		if turnID == "" {
+			turnID = "raw_turn_1"
+		}
+		pendingKey := sessionID + "\x00" + turnID
+		requestID := strings.TrimSpace(envelope.RequestID)
+		if requestID == "" {
+			if direction == "request" {
+				fallbackRequestSeq++
+				requestID = fmt.Sprintf("raw_request_%d", fallbackRequestSeq)
+				pendingByTurn[pendingKey] = append(pendingByTurn[pendingKey], requestID)
+			} else if pending := pendingByTurn[pendingKey]; len(pending) > 0 {
+				requestID = pending[0]
+				pendingByTurn[pendingKey] = pending[1:]
+			} else {
+				fallbackRequestSeq++
+				requestID = fmt.Sprintf("raw_request_%d", fallbackRequestSeq)
+			}
+		}
+		pairKey := pendingKey + "\x00" + requestID
+		if providerName == "unknown" && direction == "response" {
+			if pairedProvider := providerByPair[pairKey]; pairedProvider != "" {
+				providerName = pairedProvider
+			}
+		}
+		if direction == "request" && providerName != "" && providerName != "unknown" {
+			providerByPair[pairKey] = providerName
+		}
+		timestampMS := envelope.TimestampMS
+		if timestampMS == 0 {
+			timestampMS = int64(index + 1)
+		}
+		parsed, _ := parseEnvelopePayload(providerName, direction, body)
+		model := parsed.Model
+		if model == "" {
+			model = "unknown"
+		}
+		summary := rawEnvelopeSummary(envelope, providerName, source)
+		row := traceRequestRow{
+			ID:        rawTraceRequestID(direction, sessionID, turnID, requestID),
+			SessionID: sessionID,
+			TurnID:    turnID,
+			RequestID: requestID,
+			Direction: direction,
+			Provider:  providerName,
+			Model:     model,
+			Timestamp: epochMS(timestampMS),
+			Summary:   mustJSON(summary),
+			Outcome:   "ok",
+		}
+		if direction == "response" {
+			if envelope.StatusCode != nil {
+				row.HTTPStatus = sql.NullInt64{Int64: *envelope.StatusCode, Valid: true}
+				if *envelope.StatusCode >= 400 {
+					row.Outcome = "error"
+				}
+			}
+			if len(parsed.FinishReasons) > 0 {
+				row.StopReason = sql.NullString{String: parsed.FinishReasons[0], Valid: true}
+			}
+			if parsedFinishReasonIsError(parsed) {
+				row.Outcome = "error"
+			}
+		}
+
+		session := sessionsByID[sessionID]
+		if session == nil {
+			session = &mutableSession{
+				row: sessionRow{
+					ID:        sessionID,
+					Source:    source,
+					StartedAt: epochMS(timestampMS),
+					EndedAt:   nullableEpochMS{Int64: timestampMS, Valid: true},
+					Metadata:  "{}",
+				},
+				turns: map[string]*mutableTurn{},
+			}
+			sessionsByID[sessionID] = session
+		}
+		if timestampMS < session.row.StartedAt.Int64() {
+			session.row.StartedAt = epochMS(timestampMS)
+		}
+		if !session.row.EndedAt.Valid || timestampMS > session.row.EndedAt.Int64 {
+			session.row.EndedAt = nullableEpochMS{Int64: timestampMS, Valid: true}
+		}
+		turn := session.turns[turnID]
+		if turn == nil {
+			turn = &mutableTurn{
+				row: turnRow{
+					ID:        turnID,
+					SessionID: sessionID,
+					Status:    "completed",
+					StartedAt: epochMS(timestampMS),
+					EndedAt:   nullableEpochMS{Int64: timestampMS, Valid: true},
+				},
+			}
+			session.turns[turnID] = turn
+		}
+		if timestampMS < turn.row.StartedAt.Int64() {
+			turn.row.StartedAt = epochMS(timestampMS)
+		}
+		if !turn.row.EndedAt.Valid || timestampMS > turn.row.EndedAt.Int64 {
+			turn.row.EndedAt = nullableEpochMS{Int64: timestampMS, Valid: true}
+		}
+		turn.payloads = append(turn.payloads, tracePayload{Row: row, Body: body})
 	}
-	generationSpanID := otel.DeriveSpanID("raw-generation:" + sessionID + ":" + requestID)
-	spans = append(spans, otel.Span{
-		TraceID:       traceID,
-		SpanID:        generationSpanID,
-		ParentSpanID:  turnSpanID,
-		Name:          generationObservationName(providerName, nameModel, ""),
-		Kind:          "SPAN_KIND_CLIENT",
-		StartUnixNano: msToNs(startMS),
-		EndUnixNano:   msToNs(endMS),
-		Attributes:    attrs,
-		Status:        status,
+
+	sessionIDs := make([]string, 0, len(sessionsByID))
+	for id := range sessionsByID {
+		sessionIDs = append(sessionIDs, id)
+	}
+	sort.Slice(sessionIDs, func(i, j int) bool {
+		left := sessionsByID[sessionIDs[i]].row
+		right := sessionsByID[sessionIDs[j]].row
+		if left.StartedAt.Int64() != right.StartedAt.Int64() {
+			return left.StartedAt.Int64() < right.StartedAt.Int64()
+		}
+		return left.ID < right.ID
 	})
 
-	for index, call := range parsedResponse.ToolCalls {
-		toolID := call.ID
-		if toolID == "" {
-			toolID = fmt.Sprintf("%s:%d", requestID, index)
+	sessions := make([]rawEnvelopeSession, 0, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		mutable := sessionsByID[sessionID]
+		turnIDs := make([]string, 0, len(mutable.turns))
+		for id := range mutable.turns {
+			turnIDs = append(turnIDs, id)
 		}
-		toolName := toolObservationName(call.Name)
-		toolAttrs := map[string]any{
-			"gen_ai.operation.name":     "execute_tool",
-			"gen_ai.tool.name":          call.Name,
-			"gen_ai.tool.call.id":       toolID,
-			"session.id":                sessionID,
-			"langfuse.session.id":       sessionID,
-			"langfuse.observation.type": "tool",
-			"langfuse.trace.name":       rootName,
-			"scribe.trace_request.id":   requestID,
-			"agelish.input.kind":        "raw_http_body",
-		}
-		if call.Name != "" {
-			toolAttrs["scribe.tool.name"] = call.Name
-		}
-		if call.Namespace != "" {
-			toolAttrs["gen_ai.tool.namespace"] = call.Namespace
-		}
-		if call.Arguments != nil {
-			toolAttrs["gen_ai.tool.call.arguments"] = mustJSON(call.Arguments)
-			toolAttrs["langfuse.observation.input"] = call.Arguments
-		}
-		if result, ok := toolResultsByID[call.ID]; ok {
-			toolAttrs["scribe.tool.result.status"] = "matched"
-			toolAttrs["gen_ai.tool.call.result"] = result.Output
-			toolAttrs["langfuse.observation.output"] = result.Output
-		} else {
-			toolAttrs["scribe.tool.result.status"] = "missing"
-			toolAttrs["langfuse.observation.output"] = map[string]any{
-				"status": "missing_tool_result",
-				"reason": "no matching tool result was provided in the raw request body",
+		sort.Slice(turnIDs, func(i, j int) bool {
+			left := mutable.turns[turnIDs[i]].row
+			right := mutable.turns[turnIDs[j]].row
+			if left.StartedAt.Int64() != right.StartedAt.Int64() {
+				return left.StartedAt.Int64() < right.StartedAt.Int64()
 			}
+			return left.ID < right.ID
+		})
+		turns := make([]rawEnvelopeTurn, 0, len(turnIDs))
+		for i, turnID := range turnIDs {
+			mutableTurn := mutable.turns[turnID]
+			mutableTurn.row.Number = int64(i + 1)
+			sort.Slice(mutableTurn.payloads, func(i, j int) bool {
+				left := mutableTurn.payloads[i].Row
+				right := mutableTurn.payloads[j].Row
+				if left.Timestamp.Int64() != right.Timestamp.Int64() {
+					return left.Timestamp.Int64() < right.Timestamp.Int64()
+				}
+				return left.ID < right.ID
+			})
+			turns = append(turns, rawEnvelopeTurn{row: mutableTurn.row, payloads: mutableTurn.payloads})
+		}
+		sessions = append(sessions, rawEnvelopeSession{row: mutable.row, turns: turns})
+	}
+	return sessions, nil
+}
+
+func exportRawEnvelopeSession(session rawEnvelopeSession, inputKind string) ([]otel.Span, error) {
+	traceID := otel.DeriveTraceID("raw-session:" + session.row.ID)
+	rootSpanID := otel.DeriveSpanID("raw-session:" + session.row.ID)
+	rootEnd := session.row.StartedAt.Int64()
+	if session.row.EndedAt.Valid {
+		rootEnd = session.row.EndedAt.Int64
+	}
+	rootName := sessionSpanName(session.row)
+	rootAttrs := map[string]any{
+		"scribe.session.id":         session.row.ID,
+		"scribe.source":             session.row.Source,
+		"gen_ai.conversation.id":    session.row.ID,
+		"session.id":                session.row.ID,
+		"langfuse.session.id":       session.row.ID,
+		"langfuse.observation.type": "span",
+		"langfuse.trace.name":       rootName,
+		"agelish.input.kind":        inputKind,
+	}
+	spans := []otel.Span{{
+		TraceID:       traceID,
+		SpanID:        rootSpanID,
+		Name:          rootName,
+		Kind:          "SPAN_KIND_INTERNAL",
+		StartUnixNano: msToNs(session.row.StartedAt.Int64()),
+		EndUnixNano:   msToNs(rootEnd),
+		Attributes:    rootAttrs,
+	}}
+
+	var sessionInput any
+	var sessionOutput any
+	generationIndex := 0
+	for _, turn := range session.turns {
+		turnSpanID := otel.DeriveSpanID("raw-turn:" + session.row.ID + ":" + turn.row.ID)
+		turnEnd := turn.row.StartedAt.Int64()
+		if turn.row.EndedAt.Valid {
+			turnEnd = turn.row.EndedAt.Int64
+		}
+		turnPayloads := analyzeTracePayloads(turn.payloads)
+		if sessionInput == nil && turnPayloads.Input != nil {
+			sessionInput = turnPayloads.Input
+		}
+		if turnPayloads.Output != nil {
+			sessionOutput = turnPayloads.Output
+		}
+		turnAttrs := map[string]any{
+			"scribe.turn.id":            turn.row.ID,
+			"scribe.turn.number":        turn.row.Number,
+			"scribe.turn.status":        turn.row.Status,
+			"session.id":                session.row.ID,
+			"langfuse.session.id":       session.row.ID,
+			"gen_ai.conversation.id":    session.row.ID,
+			"langfuse.observation.type": "span",
+			"langfuse.trace.name":       rootName,
+			"agelish.input.kind":        inputKind,
+		}
+		if turnPayloads.Input != nil {
+			turnAttrs["langfuse.observation.input"] = turnPayloads.Input
+		}
+		if turnPayloads.Output != nil {
+			turnAttrs["langfuse.observation.output"] = turnPayloads.Output
 		}
 		spans = append(spans, otel.Span{
 			TraceID:       traceID,
-			SpanID:        otel.DeriveSpanID("raw-tool:" + sessionID + ":" + requestID + ":" + toolID),
-			ParentSpanID:  generationSpanID,
-			Name:          toolName,
+			SpanID:        turnSpanID,
+			ParentSpanID:  rootSpanID,
+			Name:          turnSpanName(session.row.Source, turn.row.Number),
 			Kind:          "SPAN_KIND_INTERNAL",
-			StartUnixNano: msToNs(startMS),
-			EndUnixNano:   msToNs(endMS),
-			Attributes:    toolAttrs,
-			Status:        otel.Status{Code: "STATUS_CODE_OK"},
+			StartUnixNano: msToNs(turn.row.StartedAt.Int64()),
+			EndUnixNano:   msToNs(turnEnd),
+			Attributes:    turnAttrs,
 		})
-	}
 
-	return Result{Spans: spans}, nil
+		requestByRequestID := map[string]tracePayload{}
+		for _, payload := range turn.payloads {
+			if payload.Row.Direction == "request" {
+				requestByRequestID[payload.Row.RequestID] = payload
+			}
+		}
+		for _, payload := range turn.payloads {
+			if payload.Row.Direction != "response" {
+				continue
+			}
+			paired := requestByRequestID[payload.Row.RequestID]
+			observationSpans, err := buildObservationSpansFromPayloads(traceID, turnSpanID, session.row.ID, rootName, payload.Row, paired.Row, payload.Body, paired.Body, turnPayloads.ToolResultsByID, &generationIndex)
+			if err != nil {
+				return nil, err
+			}
+			addInputKind(observationSpans, inputKind)
+			spans = append(spans, observationSpans...)
+		}
+	}
+	if sessionInput != nil {
+		rootAttrs["langfuse.trace.input"] = sessionInput
+		rootAttrs["langfuse.observation.input"] = sessionInput
+	}
+	if sessionOutput != nil {
+		rootAttrs["langfuse.trace.output"] = sessionOutput
+		rootAttrs["langfuse.observation.output"] = sessionOutput
+	}
+	return spans, nil
+}
+
+func base64Body(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(body)
+}
+
+func int64Ptr(value int64) *int64 {
+	return &value
+}
+
+func parseEnvelopePayload(providerName string, direction string, body []byte) (provider.ParsedPayload, error) {
+	if direction == "request" {
+		return provider.ParseRequest(providerName, body)
+	}
+	return provider.ParseResponse(providerName, body)
+}
+
+func rawEnvelopeProvider(envelope httpraw.Envelope) string {
+	if providerName := strings.ToLower(strings.TrimSpace(envelope.Provider)); providerName != "" {
+		return providerName
+	}
+	source := strings.ToLower(strings.TrimSpace(envelope.Source))
+	switch source {
+	case "anthropic", "codex", "openai", "openrouter":
+		return source
+	case "claude", "claude-code":
+		return "anthropic"
+	}
+	path := rawEnvelopePath(envelope.URL)
+	switch {
+	case strings.Contains(path, "/chat/completions"), strings.Contains(path, "/responses"):
+		return "openai"
+	case strings.Contains(path, "/messages"):
+		return "anthropic"
+	default:
+		return "unknown"
+	}
+}
+
+func rawEnvelopeSummary(envelope httpraw.Envelope, providerName string, source string) map[string]any {
+	summary := map[string]any{}
+	if source != "" {
+		summary["platform"] = source
+	}
+	path := rawEnvelopePath(envelope.URL)
+	if path != "" {
+		summary["path"] = path
+	}
+	if method := strings.TrimSpace(envelope.Method); method != "" {
+		summary["http_method"] = strings.ToUpper(method)
+	}
+	if len(envelope.Headers) > 0 {
+		if envelope.NormalizedDirection() == "response" {
+			summary["response_headers"] = envelope.Headers
+		} else {
+			summary["request_headers"] = envelope.Headers
+		}
+	}
+	if providerName == "openai" && strings.Contains(path, "/chat/completions") {
+		summary["protocol"] = "openai.chat_completions"
+		summary["operation_name"] = rawOperationDisplayName(source) + " Chat Completions"
+	}
+	for key, value := range envelope.Metadata {
+		if _, exists := summary[key]; !exists {
+			summary[key] = value
+		}
+	}
+	return summary
+}
+
+func rawEnvelopePath(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return ""
+	}
+	parsed, err := url.Parse(rawURL)
+	if err == nil && parsed.Path != "" {
+		return parsed.Path
+	}
+	return rawURL
+}
+
+func rawOperationDisplayName(source string) string {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return "Raw HTTP"
+	}
+	switch source {
+	case "claude-code":
+		return "Claude Code"
+	case "codex":
+		return "Codex"
+	case "openai":
+		return "OpenAI"
+	case "openrouter":
+		return "OpenRouter"
+	}
+	words := strings.Fields(strings.NewReplacer("-", " ", "_", " ").Replace(source))
+	for i, word := range words {
+		if word == "" {
+			continue
+		}
+		words[i] = strings.ToUpper(word[:1]) + word[1:]
+	}
+	if len(words) == 0 {
+		return source
+	}
+	return strings.Join(words, " ")
+}
+
+func rawTraceRequestID(direction string, sessionID string, turnID string, requestID string) string {
+	return strings.Join([]string{"raw", direction, sessionID, turnID, requestID}, ":")
+}
+
+func addInputKind(spans []otel.Span, inputKind string) {
+	for i := range spans {
+		if spans[i].Attributes == nil {
+			spans[i].Attributes = map[string]any{}
+		}
+		spans[i].Attributes["agelish.input.kind"] = inputKind
+	}
 }
 
 func resolveDBPath(dbPath string) (string, error) {
@@ -627,9 +917,7 @@ type turnPayloads struct {
 }
 
 func analyzeTurnPayloads(ctx context.Context, db *sql.DB, requests []traceRequestRow) (turnPayloads, error) {
-	payloads := turnPayloads{
-		ToolResultsByID: map[string]provider.ToolResult{},
-	}
+	var tracePayloads []tracePayload
 	for _, tr := range requests {
 		body, err := rawPayload(ctx, db, tr.ID)
 		if err != nil {
@@ -638,9 +926,20 @@ func analyzeTurnPayloads(ctx context.Context, db *sql.DB, requests []traceReques
 			}
 			return turnPayloads{}, err
 		}
+		tracePayloads = append(tracePayloads, tracePayload{Row: tr, Body: body})
+	}
+	return analyzeTracePayloads(tracePayloads), nil
+}
+
+func analyzeTracePayloads(tracePayloads []tracePayload) turnPayloads {
+	payloads := turnPayloads{
+		ToolResultsByID: map[string]provider.ToolResult{},
+	}
+	for _, payload := range tracePayloads {
+		tr := payload.Row
 		switch tr.Direction {
 		case "request":
-			parsed, _ := provider.ParseRequest(tr.Provider, body)
+			parsed, _ := provider.ParseRequest(tr.Provider, payload.Body)
 			if payloads.Input == nil && len(parsed.InputMessages) > 0 {
 				payloads.Input = parsed.InputMessages
 			}
@@ -652,7 +951,7 @@ func analyzeTurnPayloads(ctx context.Context, db *sql.DB, requests []traceReques
 			}
 			addToolResults(payloads.ToolResultsByID, parsed.ToolResults)
 		case "response":
-			parsed, _ := provider.ParseResponse(tr.Provider, body)
+			parsed, _ := provider.ParseResponse(tr.Provider, payload.Body)
 			if len(parsed.OutputMessages) > 0 {
 				payloads.Output = parsed.OutputMessages
 			}
@@ -665,7 +964,7 @@ func analyzeTurnPayloads(ctx context.Context, db *sql.DB, requests []traceReques
 			addToolResults(payloads.ToolResultsByID, parsed.ToolResults)
 		}
 	}
-	return payloads, nil
+	return payloads
 }
 
 func addToolResults(byID map[string]provider.ToolResult, results []provider.ToolResult) {
@@ -717,6 +1016,10 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 		return nil, err
 	}
 
+	return buildObservationSpansFromPayloads(traceID, turnSpanID, sessionID, traceName, response, request, responseBody, requestBody, toolResultsByID, generationIndex)
+}
+
+func buildObservationSpansFromPayloads(traceID string, turnSpanID string, sessionID string, traceName string, response traceRequestRow, request traceRequestRow, responseBody []byte, requestBody []byte, toolResultsByID map[string]provider.ToolResult, generationIndex *int) ([]otel.Span, error) {
 	parsedRequest, _ := provider.ParseRequest(response.Provider, requestBody)
 	parsedResponse, _ := provider.ParseResponse(response.Provider, responseBody)
 	requestSummary := parseSummary(request.Summary)

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/zenfun/agelish-teacher/internal/httpraw"
 	_ "modernc.org/sqlite"
 )
 
@@ -518,6 +519,70 @@ func TestExporterConvertsRawHTTPBodiesWithoutScribeDB(t *testing.T) {
 	assertAttr(t, tool.Attributes, "gen_ai.tool.name", "exec_command")
 	assertAttr(t, tool.Attributes, "scribe.tool.name", "exec_command")
 	assertAttr(t, tool.Attributes, "langfuse.trace.name", "Codex - Session raw_codex_se")
+}
+
+func TestExporterConvertsRawHTTPEnvelopesWithoutScribeDB(t *testing.T) {
+	result, err := ExportRawEnvelopes(RawEnvelopeOptions{Envelopes: []httpraw.Envelope{
+		{
+			Source:      "reasonix",
+			RequestID:   "call_env_1",
+			SessionID:   "sess_env",
+			TurnID:      "turn_env_1",
+			Direction:   "request",
+			Method:      "POST",
+			URL:         "https://api.example.test/v1/chat/completions",
+			Headers:     map[string]string{"content-type": "application/json"},
+			BodyText:    `{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"Say envelope ok."}]}`,
+			TimestampMS: 1710000000200,
+		},
+		{
+			Source:      "reasonix",
+			RequestID:   "call_env_1",
+			SessionID:   "sess_env",
+			TurnID:      "turn_env_1",
+			Direction:   "response",
+			StatusCode:  ptr(200),
+			Headers:     map[string]string{"content-type": "application/json"},
+			BodyText:    `{"model":"deepseek-v4-pro","choices":[{"message":{"role":"assistant","content":"envelope ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`,
+			TimestampMS: 1710000001200,
+		},
+	}})
+	if err != nil {
+		t.Fatalf("export raw envelopes: %v", err)
+	}
+
+	if len(result.Spans) != 3 {
+		t.Fatalf("expected session, turn, generation spans; got %d: %#v", len(result.Spans), result.Spans)
+	}
+	session := findSpanByAttr(t, result.Spans, "scribe.session.id", "sess_env")
+	if session.Name != "reasonix - Session sess_env" {
+		t.Fatalf("session name mismatch: %q", session.Name)
+	}
+	assertAttr(t, session.Attributes, "agelish.input.kind", "raw_http_envelope")
+
+	turn := findSpanByAttr(t, result.Spans, "scribe.turn.id", "turn_env_1")
+	if turn.ParentSpanID != session.SpanID {
+		t.Fatalf("turn parent mismatch: got %s want %s", turn.ParentSpanID, session.SpanID)
+	}
+	assertAttr(t, turn.Attributes, "agelish.input.kind", "raw_http_envelope")
+
+	generation := findSpanByAttr(t, result.Spans, "langfuse.observation.type", "generation")
+	if generation.ParentSpanID != turn.SpanID {
+		t.Fatalf("generation parent mismatch: got %s want %s", generation.ParentSpanID, turn.SpanID)
+	}
+	if generation.Name != "Reasonix Chat Completions" {
+		t.Fatalf("generation name mismatch: %q", generation.Name)
+	}
+	assertAttr(t, generation.Attributes, "agelish.input.kind", "raw_http_envelope")
+	assertAttr(t, generation.Attributes, "gen_ai.provider.name", "reasonix")
+	assertAttr(t, generation.Attributes, "scribe.provider.name", "openai")
+	assertAttr(t, generation.Attributes, "scribe.platform", "reasonix")
+	assertAttr(t, generation.Attributes, "scribe.protocol", "openai.chat_completions")
+	assertAttr(t, generation.Attributes, "http.response.status_code", int64(200))
+	assertAttr(t, generation.Attributes, "gen_ai.usage.input_tokens", int64(2))
+	assertAttr(t, generation.Attributes, "gen_ai.usage.output_tokens", int64(3))
+	assertAttrJSONContains(t, generation.Attributes, "langfuse.observation.input", "Say envelope ok.")
+	assertAttrJSONContains(t, generation.Attributes, "langfuse.observation.output", "envelope ok")
 }
 
 func TestExporterConvertsRawHTTPErrorBodyAsDiagnosticGeneration(t *testing.T) {
