@@ -83,6 +83,35 @@ func TestExporterBuildsSessionTurnGenerationAndToolSpansFromScribeDB(t *testing.
 	assertAttr(t, tool.Attributes, "gen_ai.tool.call.id", "toolu_2")
 }
 
+func TestExporterNamesClaudeCodeSessionAndTurnSpans(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "traces.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	createScribeSchema(t, db)
+
+	insertSession(t, db, "019f1caec3ab7552bf2c7e6a1725ce3d", "claude-code", 1710000000000, 1710000005000)
+	insertTurn(t, db, "turn_claude_2", "019f1caec3ab7552bf2c7e6a1725ce3d", 2, "completed", 1710000000100, 1710000004000)
+
+	result, err := Export(context.Background(), Options{DBPath: dbPath})
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+
+	session := findSpanByAttr(t, result.Spans, "scribe.session.id", "019f1caec3ab7552bf2c7e6a1725ce3d")
+	if session.Name != "Claude Code - Session 019f1caec3ab" {
+		t.Fatalf("session name mismatch: %q", session.Name)
+	}
+	assertAttr(t, session.Attributes, "langfuse.trace.name", "Claude Code - Session 019f1caec3ab")
+
+	turn := findSpanByAttr(t, result.Spans, "scribe.turn.id", "turn_claude_2")
+	if turn.Name != "Claude Code - Turn 2" {
+		t.Fatalf("turn name mismatch: %q", turn.Name)
+	}
+}
+
 func TestExporterAddsLangfuseInputOutputAndToolResultOutput(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "traces.db")
 	db, err := sql.Open("sqlite", dbPath)

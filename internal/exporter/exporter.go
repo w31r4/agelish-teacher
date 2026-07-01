@@ -174,10 +174,12 @@ func exportSession(ctx context.Context, db *sql.DB, session sessionRow) ([]otel.
 		"langfuse.session.id":       session.ID,
 		"langfuse.observation.type": "span",
 	}
+	rootName := sessionSpanName(session)
+	rootAttrs["langfuse.trace.name"] = rootName
 	spans := []otel.Span{{
 		TraceID:       traceID,
 		SpanID:        rootSpanID,
-		Name:          "scribe.session",
+		Name:          rootName,
 		Kind:          "SPAN_KIND_INTERNAL",
 		StartUnixNano: msToNs(session.StartedAt.Int64()),
 		EndUnixNano:   msToNs(rootEnd),
@@ -225,7 +227,7 @@ func exportSession(ctx context.Context, db *sql.DB, session sessionRow) ([]otel.
 			TraceID:       traceID,
 			SpanID:        turnSpanID,
 			ParentSpanID:  rootSpanID,
-			Name:          fmt.Sprintf("scribe.turn.%d", turn.Number),
+			Name:          turnSpanName(session.Source, turn.Number),
 			Kind:          "SPAN_KIND_INTERNAL",
 			StartUnixNano: msToNs(turn.StartedAt.Int64()),
 			EndUnixNano:   msToNs(turnEnd),
@@ -259,6 +261,46 @@ func exportSession(ctx context.Context, db *sql.DB, session sessionRow) ([]otel.
 		rootAttrs["langfuse.observation.output"] = sessionOutput
 	}
 	return spans, nil
+}
+
+func sessionSpanName(session sessionRow) string {
+	label := shortSessionLabel(session.ID)
+	if session.Name.Valid {
+		name := strings.TrimSpace(session.Name.String)
+		if name != "" && name != session.ID {
+			label = name
+		}
+	}
+	return fmt.Sprintf("%s - Session %s", sourceDisplayName(session.Source), label)
+}
+
+func turnSpanName(source string, number int64) string {
+	return fmt.Sprintf("%s - Turn %d", sourceDisplayName(source), number)
+}
+
+func sourceDisplayName(source string) string {
+	switch source {
+	case "claude-code":
+		return "Claude Code"
+	case "codex":
+		return "Codex"
+	case "cursor":
+		return "Cursor"
+	case "gemini-cli":
+		return "Gemini CLI"
+	default:
+		if strings.TrimSpace(source) == "" {
+			return "Scribe"
+		}
+		return source
+	}
+}
+
+func shortSessionLabel(id string) string {
+	if len(id) <= 12 {
+		return id
+	}
+	return id[:12]
 }
 
 func loadTurns(ctx context.Context, db *sql.DB, sessionID string) ([]turnRow, error) {
