@@ -75,6 +75,40 @@ func TestOpenAIResponsesOutputItemDoneMapsStreamingToolCalls(t *testing.T) {
 	}
 }
 
+func TestOpenAIChatCompletionsChunkSSEMapsAssistantOutputAndReasoning(t *testing.T) {
+	raw := []byte("data: {\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":\"Plan\"},\"finish_reason\":null}],\"usage\":null}\n\n" +
+		"data: {\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"content\":null,\"reasoning_content\":\" done\"},\"finish_reason\":null}],\"usage\":null}\n\n" +
+		"data: {\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"content\":\"reason\",\"reasoning_content\":null},\"finish_reason\":null}],\"usage\":null}\n\n" +
+		"data: {\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"content\":\"ix ok\",\"reasoning_content\":null},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7,\"completion_tokens_details\":{\"reasoning_tokens\":2}}}\n\n" +
+		"data: [DONE]\n\n")
+
+	out, err := ParseResponse("openai", raw)
+	if err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if out.Model != "deepseek-v4-pro" {
+		t.Fatalf("model mismatch: %q", out.Model)
+	}
+	if len(out.OutputMessages) != 1 || out.OutputMessages[0].Content != "reasonix ok" {
+		t.Fatalf("assistant output mismatch: %#v", out.OutputMessages)
+	}
+	if len(out.Reasoning) != 1 || out.Reasoning[0] != "Plan done" {
+		t.Fatalf("reasoning mismatch: %#v", out.Reasoning)
+	}
+	if len(out.FinishReasons) != 1 || out.FinishReasons[0] != "stop" {
+		t.Fatalf("finish reason mismatch: %#v", out.FinishReasons)
+	}
+	if out.Usage.InputTokens == nil || *out.Usage.InputTokens != 3 {
+		t.Fatalf("input usage mismatch: %#v", out.Usage.InputTokens)
+	}
+	if out.Usage.OutputTokens == nil || *out.Usage.OutputTokens != 4 {
+		t.Fatalf("output usage mismatch: %#v", out.Usage.OutputTokens)
+	}
+	if out.Usage.ReasoningTokens == nil || *out.Usage.ReasoningTokens != 2 {
+		t.Fatalf("reasoning usage mismatch: %#v", out.Usage.ReasoningTokens)
+	}
+}
+
 func TestOpenAIRequestMapsInstructionsInputAndToolResults(t *testing.T) {
 	raw := []byte(`{
 		"instructions": "You are Codex.",
