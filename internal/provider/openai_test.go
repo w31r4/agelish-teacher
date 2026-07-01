@@ -1,6 +1,9 @@
 package provider
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestOpenAIResponsesCompletedEventMapsHeterogeneousOutput(t *testing.T) {
 	raw := []byte("event: response.created\n" +
@@ -97,6 +100,32 @@ func TestOpenAIRequestMapsInstructionsInputAndToolResults(t *testing.T) {
 	}
 	if got := in.MaxTokens; got == nil || *got != 2048 {
 		t.Fatalf("max_output_tokens not extracted: %#v", got)
+	}
+}
+
+func TestOpenAIRequestExtractsCodexGoalContext(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">\nContinue working toward the active thread goal.\n<objective>\nMake Codex traces readable.\n</objective>\n</codex_internal_context>\nNow continue."}]}
+		]
+	}`)
+
+	in, err := ParseRequest("codex", raw)
+	if err != nil {
+		t.Fatalf("parse request: %v", err)
+	}
+	if len(in.InternalContexts) != 1 {
+		t.Fatalf("expected one internal context, got %#v", in.InternalContexts)
+	}
+	got := in.InternalContexts[0]
+	if got.Source != "goal" {
+		t.Fatalf("goal source mismatch: %#v", got)
+	}
+	if got.Objective != "Make Codex traces readable." {
+		t.Fatalf("goal objective mismatch: %#v", got)
+	}
+	if !strings.Contains(got.Content, "Continue working toward the active thread goal") {
+		t.Fatalf("goal content mismatch: %#v", got)
 	}
 }
 

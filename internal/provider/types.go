@@ -3,6 +3,7 @@ package provider
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -18,6 +19,13 @@ type ParsedPayload struct {
 	FinishReasons      []string
 	MaxTokens          *int64
 	Reasoning          []string
+	InternalContexts   []InternalContext
+}
+
+type InternalContext struct {
+	Source    string
+	Objective string
+	Content   string
 }
 
 type Usage struct {
@@ -219,7 +227,52 @@ func finalizeParsed(parsed ParsedPayload) ParsedPayload {
 			parsed.OutputMessages[i].Content = contentFromParts(parsed.OutputMessages[i].Parts)
 		}
 	}
+	parsed.InternalContexts = append(parsed.InternalContexts, extractInternalContexts(parsed.InputMessages)...)
 	return parsed
+}
+
+var (
+	codexInternalContextPattern = regexp.MustCompile(`(?s)<codex_internal_context\s+source=["']([^"']+)["']>(.*?)</codex_internal_context>`)
+	codexObjectivePattern       = regexp.MustCompile(`(?s)<objective>\s*(.*?)\s*</objective>`)
+)
+
+func extractInternalContexts(messages []Message) []InternalContext {
+	var contexts []InternalContext
+	for _, message := range messages {
+		for _, text := range messageTextSegments(message) {
+			for _, match := range codexInternalContextPattern.FindAllStringSubmatch(text, -1) {
+				content := strings.TrimSpace(match[2])
+				context := InternalContext{
+					Source:  strings.TrimSpace(match[1]),
+					Content: content,
+				}
+				if objective := codexObjectivePattern.FindStringSubmatch(content); len(objective) == 2 {
+					context.Objective = strings.TrimSpace(objective[1])
+				}
+				contexts = append(contexts, context)
+			}
+		}
+	}
+	return contexts
+}
+
+func messageTextSegments(message Message) []string {
+	if len(message.Parts) > 0 {
+		var texts []string
+		for _, part := range message.Parts {
+			if part.Type != "text" {
+				continue
+			}
+			if text, ok := part.Content.(string); ok && strings.TrimSpace(text) != "" {
+				texts = append(texts, text)
+			}
+		}
+		return texts
+	}
+	if text, ok := message.Content.(string); ok && strings.TrimSpace(text) != "" {
+		return []string{text}
+	}
+	return nil
 }
 
 func contentFromParts(parts []Part) any {
