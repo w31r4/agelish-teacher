@@ -239,9 +239,9 @@ func TestExporterKeepsSystemPromptOnlyOnFirstGenerationDisplayInput(t *testing.T
 		Direction: "response", Provider: "codex", Model: "gpt-5-codex", Timestamp: 1710000003200,
 		Outcome: "ok", HTTPStatus: 200, StopReason: "completed", Summary: subagentSummary,
 	})
-	insertRawPayload(t, db, "raw_req_first", "req_first", "identity", []byte(`{"model":"gpt-5-codex","instructions":"First system prompt.","input":"First user."}`))
+	insertRawPayload(t, db, "raw_req_first", "req_first", "identity", []byte(`{"model":"gpt-5-codex","instructions":"First system prompt.","input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"First developer prompt."}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"First user."}]}]}`))
 	insertRawPayload(t, db, "raw_resp_first", "resp_first", "identity", []byte(`{"model":"gpt-5-codex","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"First output."}]}]}`))
-	insertRawPayload(t, db, "raw_req_second", "req_second", "identity", []byte(`{"model":"gpt-5-codex","instructions":"Second system prompt.","input":"Second user."}`))
+	insertRawPayload(t, db, "raw_req_second", "req_second", "identity", []byte(`{"model":"gpt-5-codex","instructions":"Second system prompt.","input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"Second developer prompt."}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"Second user."}]}]}`))
 	insertRawPayload(t, db, "raw_resp_second", "resp_second", "identity", []byte(`{"model":"gpt-5-codex","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Second output."}]}]}`))
 
 	result, err := Export(context.Background(), Options{DBPath: dbPath})
@@ -254,22 +254,30 @@ func TestExporterKeepsSystemPromptOnlyOnFirstGenerationDisplayInput(t *testing.T
 		"scribe.trace_request.id":   "resp_first",
 	})
 	assertAttrJSONContains(t, firstGeneration.Attributes, "langfuse.observation.input", "First system prompt.")
+	assertAttrJSONContains(t, firstGeneration.Attributes, "langfuse.observation.input", "First developer prompt.")
 	assertAttrJSONContains(t, firstGeneration.Attributes, "gen_ai.system_instructions", "First system prompt.")
+	assertAttrJSONContains(t, firstGeneration.Attributes, "gen_ai.system_instructions", "First developer prompt.")
+	assertAttrJSONContains(t, firstGeneration.Attributes, "langfuse.observation.metadata.systemPrompt", "First developer prompt.")
 
 	secondGeneration := findSpanByAttrs(t, result.Spans, map[string]any{
 		"langfuse.observation.type": "generation",
 		"scribe.trace_request.id":   "resp_second",
 	})
 	assertAttrJSONNotContains(t, secondGeneration.Attributes, "langfuse.observation.input", "Second system prompt.")
+	assertAttrJSONNotContains(t, secondGeneration.Attributes, "langfuse.observation.input", "Second developer prompt.")
 	assertAttrJSONContains(t, secondGeneration.Attributes, "langfuse.observation.input", "Second user.")
 	assertAttrJSONContains(t, secondGeneration.Attributes, "gen_ai.system_instructions", "Second system prompt.")
+	assertAttrJSONContains(t, secondGeneration.Attributes, "gen_ai.system_instructions", "Second developer prompt.")
+	assertAttrJSONContains(t, secondGeneration.Attributes, "langfuse.observation.metadata.systemPrompt", "Second developer prompt.")
 	assertAttrJSONContains(t, secondGeneration.Attributes, "gen_ai.input.messages", "Second system prompt.")
+	assertAttrJSONContains(t, secondGeneration.Attributes, "gen_ai.input.messages", "Second developer prompt.")
 
 	agent := findSpanByAttrs(t, result.Spans, map[string]any{
 		"langfuse.observation.type": "agent",
 		"scribe.trace_request.id":   "resp_second",
 	})
 	assertAttrJSONNotContains(t, agent.Attributes, "langfuse.observation.input", "Second system prompt.")
+	assertAttrJSONNotContains(t, agent.Attributes, "langfuse.observation.input", "Second developer prompt.")
 	assertAttrJSONContains(t, agent.Attributes, "langfuse.observation.input", "Second user.")
 }
 
@@ -304,7 +312,7 @@ func TestExporterEmitsDiagnosticDisplayInputWhenSystemFilteringRemovesEverything
 	})
 	insertRawPayload(t, db, "raw_req_first_system_only", "req_first_system_only", "identity", []byte(`{"model":"gpt-5-codex","instructions":"First system prompt.","input":"First user."}`))
 	insertRawPayload(t, db, "raw_resp_first_system_only", "resp_first_system_only", "identity", []byte(`{"model":"gpt-5-codex","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"First output."}]}]}`))
-	insertRawPayload(t, db, "raw_req_later_system_only", "req_later_system_only", "identity", []byte(`{"model":"gpt-5-codex","instructions":"Only system prompt."}`))
+	insertRawPayload(t, db, "raw_req_later_system_only", "req_later_system_only", "identity", []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"Only developer prompt."}]}]}`))
 	insertRawPayload(t, db, "raw_resp_later_system_only", "resp_later_system_only", "identity", []byte(`{"model":"gpt-5-codex","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Later output."}]}]}`))
 
 	result, err := Export(context.Background(), Options{DBPath: dbPath})
@@ -326,8 +334,9 @@ func TestExporterEmitsDiagnosticDisplayInputWhenSystemFilteringRemovesEverything
 	if displayInput["system_prompt_in_metadata"] != true {
 		t.Fatalf("diagnostic should point to metadata system prompt: %#v", displayInput)
 	}
-	assertAttrJSONContains(t, laterGeneration.Attributes, "gen_ai.system_instructions", "Only system prompt.")
-	assertAttrJSONContains(t, laterGeneration.Attributes, "gen_ai.input.messages", "Only system prompt.")
+	assertAttrJSONContains(t, laterGeneration.Attributes, "gen_ai.system_instructions", "Only developer prompt.")
+	assertAttrJSONContains(t, laterGeneration.Attributes, "langfuse.observation.metadata.systemPrompt", "Only developer prompt.")
+	assertAttrJSONContains(t, laterGeneration.Attributes, "gen_ai.input.messages", "Only developer prompt.")
 }
 
 func TestExporterAddsDiagnosticOutputAndErrorTypeForFailedGeneration(t *testing.T) {

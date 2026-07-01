@@ -249,9 +249,7 @@ func ExportRawPair(opts RawPairOptions) (Result, error) {
 	if len(parsedResponse.FinishReasons) > 0 {
 		attrs["gen_ai.response.finish_reasons"] = parsedResponse.FinishReasons
 	}
-	if len(parsedRequest.SystemInstructions) > 0 {
-		attrs["gen_ai.system_instructions"] = mustJSON(parsedRequest.SystemInstructions)
-	}
+	addSystemInstructionAttributes(attrs, parsedRequest)
 	if len(parsedRequest.InputMessages) > 0 {
 		attrs["gen_ai.input.messages"] = mustJSON(parsedRequest.InputMessages)
 		attrs["gen_ai.prompt"] = mustJSON(parsedRequest.InputMessages)
@@ -818,9 +816,7 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 	} else if len(parsedResponse.FinishReasons) > 0 {
 		attrs["gen_ai.response.finish_reasons"] = parsedResponse.FinishReasons
 	}
-	if len(parsedRequest.SystemInstructions) > 0 {
-		attrs["gen_ai.system_instructions"] = mustJSON(parsedRequest.SystemInstructions)
-	}
+	addSystemInstructionAttributes(attrs, parsedRequest)
 	if len(parsedRequest.InputMessages) > 0 {
 		attrs["gen_ai.input.messages"] = mustJSON(parsedRequest.InputMessages)
 		attrs["gen_ai.prompt"] = mustJSON(parsedRequest.InputMessages)
@@ -864,6 +860,7 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 		}
 		addScribeSummaryAttributes(agentAttrs, summaries)
 		addInternalContextAttributes(agentAttrs, parsedRequest.InternalContexts)
+		addSystemInstructionAttributes(agentAttrs, parsedRequest)
 		if len(parsedRequest.InputMessages) > 0 {
 			agentAttrs["langfuse.observation.input"] = langfuseDisplayInput(parsedRequest.InputMessages, includeSystemInDisplay)
 		}
@@ -1130,15 +1127,78 @@ func addInternalContextAttributes(attrs map[string]any, contexts []provider.Inte
 	}
 }
 
+func addSystemInstructionAttributes(attrs map[string]any, parsed provider.ParsedPayload) {
+	instructions := systemInstructionTexts(parsed)
+	if len(instructions) == 0 {
+		return
+	}
+	encoded := mustJSON(instructions)
+	attrs["gen_ai.system_instructions"] = encoded
+	attrs["langfuse.observation.metadata.systemPrompt"] = encoded
+}
+
+func systemInstructionTexts(parsed provider.ParsedPayload) []string {
+	var instructions []string
+	seen := map[string]bool{}
+	add := func(text string) {
+		trimmed := strings.TrimSpace(text)
+		if trimmed == "" || seen[trimmed] {
+			return
+		}
+		seen[trimmed] = true
+		instructions = append(instructions, text)
+	}
+	for _, instruction := range parsed.SystemInstructions {
+		add(instruction)
+	}
+	for _, message := range parsed.InputMessages {
+		if !isPromptLikeRole(message.Role) {
+			continue
+		}
+		for _, text := range messageTextSegments(message) {
+			add(text)
+		}
+	}
+	return instructions
+}
+
+func messageTextSegments(message provider.Message) []string {
+	if len(message.Parts) > 0 {
+		var texts []string
+		for _, part := range message.Parts {
+			if part.Type != "text" {
+				continue
+			}
+			if text, ok := part.Content.(string); ok && strings.TrimSpace(text) != "" {
+				texts = append(texts, text)
+			}
+		}
+		return texts
+	}
+	if text, ok := message.Content.(string); ok && strings.TrimSpace(text) != "" {
+		return []string{text}
+	}
+	return nil
+}
+
+func isPromptLikeRole(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "system", "developer":
+		return true
+	default:
+		return false
+	}
+}
+
 func langfuseDisplayInput(messages []provider.Message, includeSystem bool) any {
 	if includeSystem {
 		return messages
 	}
 	displayMessages := make([]provider.Message, 0, len(messages))
-	filteredSystem := false
+	filteredPrompt := false
 	for _, message := range messages {
-		if strings.EqualFold(strings.TrimSpace(message.Role), "system") {
-			filteredSystem = true
+		if isPromptLikeRole(message.Role) {
+			filteredPrompt = true
 			continue
 		}
 		displayMessages = append(displayMessages, message)
@@ -1146,10 +1206,10 @@ func langfuseDisplayInput(messages []provider.Message, includeSystem bool) any {
 	if len(displayMessages) > 0 {
 		return displayMessages
 	}
-	if filteredSystem {
+	if filteredPrompt {
 		return map[string]any{
 			"status":                    "input_filtered",
-			"reason":                    "system prompt hidden from repeated Langfuse display input",
+			"reason":                    "system/developer prompt hidden from repeated Langfuse display input",
 			"system_prompt_in_metadata": true,
 		}
 	}
