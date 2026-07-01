@@ -1,6 +1,10 @@
 package provider
 
-import "strings"
+import (
+	"encoding/json"
+	"sort"
+	"strings"
+)
 
 var openAIToolCallTypes = map[string]bool{
 	"function_call":         true,
@@ -40,7 +44,22 @@ func parseOpenAIRequest(body []byte) (ParsedPayload, error) {
 				continue
 			}
 			role := normalizeRole(msg["role"], "user")
+			if role == "tool" {
+				result := openAIChatToolResult(msg)
+				parsed.InputMessages = append(parsed.InputMessages, Message{
+					Role:  role,
+					Parts: []Part{toolResultPart(result.ID, result.Output)},
+				})
+				parsed.ToolResults = append(parsed.ToolResults, result)
+				continue
+			}
 			parts := openAIContentParts(msg["content"])
+			if role == "assistant" {
+				for _, call := range openAIChatToolCalls(msg["tool_calls"]) {
+					parts = append(parts, toolCallPart(call.ID, call.Name, call.Arguments))
+					parsed.ToolCalls = append(parsed.ToolCalls, call)
+				}
+			}
 			if len(parts) > 0 {
 				parsed.InputMessages = append(parsed.InputMessages, Message{Role: role, Parts: parts})
 			}
@@ -141,6 +160,13 @@ type openAIChatCompletionStream struct {
 	reasoning     strings.Builder
 	usage         Usage
 	finishReasons []string
+	toolCalls     map[int]*openAIChatCompletionToolCall
+}
+
+type openAIChatCompletionToolCall struct {
+	ID        string
+	Name      string
+	Arguments string
 }
 
 func isOpenAIChatCompletionChunk(data map[string]any) bool {
@@ -178,6 +204,51 @@ func (stream *openAIChatCompletionStream) add(data map[string]any) {
 		if text := firstString(delta["content"]); text != "" {
 			stream.content.WriteString(text)
 		}
+		stream.addToolCallDeltas(delta["tool_calls"])
+	}
+}
+
+func (stream *openAIChatCompletionStream) addToolCallDeltas(raw any) {
+	rawCalls, ok := raw.([]any)
+	if !ok {
+		return
+	}
+	if stream.toolCalls == nil {
+		stream.toolCalls = map[int]*openAIChatCompletionToolCall{}
+	}
+	for _, rawCall := range rawCalls {
+		call, ok := rawCall.(map[string]any)
+		if !ok {
+			continue
+		}
+		index := 0
+		if got := asInt64(call["index"]); got != nil {
+			index = int(*got)
+		}
+		accum := stream.toolCalls[index]
+		if accum == nil {
+			accum = &openAIChatCompletionToolCall{}
+			stream.toolCalls[index] = accum
+		}
+		if id := firstString(call["id"]); id != "" {
+			accum.ID = id
+		}
+		function, _ := call["function"].(map[string]any)
+		if name := firstString(function["name"]); name != "" {
+			accum.Name = name
+		}
+		if rawArgs, ok := function["arguments"]; ok {
+			switch args := rawArgs.(type) {
+			case string:
+				accum.Arguments += args
+			case nil:
+				continue
+			default:
+				if accum.Arguments == "" {
+					accum.Arguments = compactJSON(args)
+				}
+			}
+		}
 	}
 }
 
@@ -204,10 +275,54 @@ func (stream openAIChatCompletionStream) parsed() ParsedPayload {
 	if content := stream.content.String(); content != "" {
 		parts = append(parts, textPart(content))
 	}
+	for _, call := range stream.parsedToolCalls() {
+		parsed.ToolCalls = append(parsed.ToolCalls, call)
+		parts = append(parts, toolCallPart(call.ID, call.Name, call.Arguments))
+	}
 	if len(parts) > 0 {
 		parsed.OutputMessages = append(parsed.OutputMessages, Message{Role: "assistant", Parts: parts})
 	}
 	return parsed
+}
+
+func (stream openAIChatCompletionStream) parsedToolCalls() []ToolCall {
+	if len(stream.toolCalls) == 0 {
+		return nil
+	}
+	indexes := make([]int, 0, len(stream.toolCalls))
+	for index := range stream.toolCalls {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	calls := make([]ToolCall, 0, len(indexes))
+	for _, index := range indexes {
+		call := stream.toolCalls[index]
+		if call == nil {
+			continue
+		}
+		calls = append(calls, ToolCall{
+			ID:        call.ID,
+			Name:      call.Name,
+			Arguments: openAIChatCompletionToolArguments(call.Arguments),
+		})
+	}
+	return calls
+}
+
+func openAIChatCompletionToolArguments(raw string) any {
+	return openAIToolArguments(raw)
+}
+
+func openAIToolArguments(raw any) any {
+	trimmed := strings.TrimSpace(firstString(raw))
+	if trimmed == "" {
+		return map[string]any{}
+	}
+	var decoded any
+	if err := json.Unmarshal([]byte(trimmed), &decoded); err == nil && decoded != nil {
+		return decoded
+	}
+	return firstString(raw)
 }
 
 func appendOpenAIStreamOutputItem(output *[]any, byID map[string]int, item map[string]any) {
@@ -336,6 +451,34 @@ func openAIInputItem(raw any) ([]Message, []ToolCall, []ToolResult) {
 		return []Message{{Role: "tool", Parts: []Part{toolResultPart(result.ID, result.Output)}}}, nil, []ToolResult{result}
 	}
 	return nil, nil, nil
+}
+
+func openAIChatToolCalls(raw any) []ToolCall {
+	rawCalls, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	var calls []ToolCall
+	for _, rawCall := range rawCalls {
+		call, ok := rawCall.(map[string]any)
+		if !ok {
+			continue
+		}
+		function, _ := call["function"].(map[string]any)
+		calls = append(calls, ToolCall{
+			ID:        firstString(call["id"], call["call_id"]),
+			Name:      firstString(function["name"], call["name"]),
+			Arguments: openAIToolArguments(firstNonNil(function["arguments"], call["arguments"])),
+		})
+	}
+	return calls
+}
+
+func openAIChatToolResult(msg map[string]any) ToolResult {
+	return ToolResult{
+		ID:     firstString(msg["tool_call_id"], msg["id"], msg["call_id"]),
+		Output: firstNonNil(msg["content"], msg["output"], msg["result"]),
+	}
 }
 
 func openAIContentParts(raw any) []Part {

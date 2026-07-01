@@ -109,6 +109,39 @@ func TestOpenAIChatCompletionsChunkSSEMapsAssistantOutputAndReasoning(t *testing
 	}
 }
 
+func TestOpenAIChatCompletionsChunkSSEMapsStreamingToolCalls(t *testing.T) {
+	raw := []byte("data: {\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_ls\",\"type\":\"function\",\"function\":{\"name\":\"ls\",\"arguments\":\"\"}}]},\"finish_reason\":null}],\"usage\":null}\n\n" +
+		"data: {\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":null}],\"usage\":null}\n\n" +
+		"data: {\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\".\\\"}\"}}]},\"finish_reason\":null}],\"usage\":null}\n\n" +
+		"data: {\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4-pro\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_read\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6}}\n\n")
+
+	out, err := ParseResponse("openai", raw)
+	if err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if len(out.ToolCalls) != 2 {
+		t.Fatalf("expected two tool calls, got %#v", out.ToolCalls)
+	}
+	if out.ToolCalls[0].ID != "call_ls" || out.ToolCalls[0].Name != "ls" {
+		t.Fatalf("first tool call identity mismatch: %#v", out.ToolCalls[0])
+	}
+	if args, ok := out.ToolCalls[0].Arguments.(map[string]any); !ok || args["path"] != "." {
+		t.Fatalf("first tool args mismatch: %#v", out.ToolCalls[0].Arguments)
+	}
+	if out.ToolCalls[1].ID != "call_read" || out.ToolCalls[1].Name != "read_file" {
+		t.Fatalf("second tool call identity mismatch: %#v", out.ToolCalls[1])
+	}
+	if len(out.OutputMessages) != 1 || len(out.OutputMessages[0].Parts) != 2 {
+		t.Fatalf("expected assistant tool-call message, got %#v", out.OutputMessages)
+	}
+	if out.OutputMessages[0].Parts[0].Type != "tool_call" || out.OutputMessages[0].Parts[1].Name != "read_file" {
+		t.Fatalf("tool-call parts mismatch: %#v", out.OutputMessages[0].Parts)
+	}
+	if len(out.FinishReasons) != 1 || out.FinishReasons[0] != "tool_calls" {
+		t.Fatalf("finish reason mismatch: %#v", out.FinishReasons)
+	}
+}
+
 func TestOpenAIRequestMapsInstructionsInputAndToolResults(t *testing.T) {
 	raw := []byte(`{
 		"instructions": "You are Codex.",
@@ -134,6 +167,36 @@ func TestOpenAIRequestMapsInstructionsInputAndToolResults(t *testing.T) {
 	}
 	if got := in.MaxTokens; got == nil || *got != 2048 {
 		t.Fatalf("max_output_tokens not extracted: %#v", got)
+	}
+}
+
+func TestOpenAIRequestMapsChatCompletionsToolMessages(t *testing.T) {
+	raw := []byte(`{
+		"model": "deepseek-v4-pro",
+		"messages": [
+			{"role":"user","content":"Inspect files."},
+			{"role":"assistant","content":null,"tool_calls":[
+				{"id":"call_ls","type":"function","function":{"name":"ls","arguments":"{\"path\":\".\"}"}}
+			]},
+			{"role":"tool","tool_call_id":"call_ls","name":"ls","content":"README.md\nmain.go\n"}
+		]
+	}`)
+
+	in, err := ParseRequest("openai", raw)
+	if err != nil {
+		t.Fatalf("parse request: %v", err)
+	}
+	if len(in.ToolCalls) != 1 || in.ToolCalls[0].ID != "call_ls" || in.ToolCalls[0].Name != "ls" {
+		t.Fatalf("tool calls mismatch: %#v", in.ToolCalls)
+	}
+	if len(in.ToolResults) != 1 || in.ToolResults[0].ID != "call_ls" || in.ToolResults[0].Output != "README.md\nmain.go\n" {
+		t.Fatalf("tool results mismatch: %#v", in.ToolResults)
+	}
+	if len(in.InputMessages) != 3 {
+		t.Fatalf("expected user/assistant/tool messages, got %#v", in.InputMessages)
+	}
+	if in.InputMessages[1].Parts[0].Type != "tool_call" || in.InputMessages[2].Parts[0].Type != "tool_result" {
+		t.Fatalf("tool message parts mismatch: %#v", in.InputMessages)
 	}
 }
 
