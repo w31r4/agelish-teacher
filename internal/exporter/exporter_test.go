@@ -246,6 +246,52 @@ func TestExporterAddsDiagnosticOutputAndErrorTypeForFailedGeneration(t *testing.
 	}
 }
 
+func TestExporterSanitizesVolatileErrorMessageAndKeepsRawMessage(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "traces.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	createScribeSchema(t, db)
+
+	rawMessage := "Cannot connect to host chatgpt.com:443 ssl:<truststore._api.SSLContext object at 0x7d2f805caf90> [None]"
+	displayMessage := "Cannot connect to host chatgpt.com:443 [None]"
+	insertSession(t, db, "sess_sanitized_error", "codex", 1710000000000, 1710000004000)
+	insertTurn(t, db, "turn_sanitized_error", "sess_sanitized_error", 1, "completed", 1710000000100, 1710000003000)
+	insertTraceRequest(t, db, traceRow{
+		ID: "req_sanitized_error", SessionID: "sess_sanitized_error", TurnID: "turn_sanitized_error", RequestID: "call_sanitized_error",
+		Direction: "request", Provider: "codex", Model: "gpt-5.5", Timestamp: 1710000000200,
+	})
+	insertTraceRequest(t, db, traceRow{
+		ID: "resp_sanitized_error", SessionID: "sess_sanitized_error", TurnID: "turn_sanitized_error", RequestID: "call_sanitized_error",
+		Direction: "response", Provider: "codex", Model: "gpt-5.5", Timestamp: 1710000001200,
+		Outcome: "error", ErrorType: "transport", StopReason: "error", ErrorMessage: rawMessage,
+	})
+	insertRawPayload(t, db, "raw_req_sanitized_error", "req_sanitized_error", "identity", []byte(`{"model":"gpt-5.5","input":"Run audit."}`))
+
+	result, err := Export(context.Background(), Options{DBPath: dbPath})
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+
+	generation := findSpanByAttr(t, result.Spans, "langfuse.observation.type", "generation")
+	if generation.Status.Message != displayMessage {
+		t.Fatalf("status message should be sanitized: got %q want %q", generation.Status.Message, displayMessage)
+	}
+	assertAttr(t, generation.Attributes, "langfuse.observation.status_message", displayMessage)
+	output, ok := generation.Attributes["langfuse.observation.output"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected diagnostic output map, got %#v", generation.Attributes["langfuse.observation.output"])
+	}
+	if output["message"] != displayMessage {
+		t.Fatalf("diagnostic message should be sanitized: got %#v want %q", output["message"], displayMessage)
+	}
+	if output["raw_message"] != rawMessage {
+		t.Fatalf("diagnostic raw_message should preserve original: got %#v want %q", output["raw_message"], rawMessage)
+	}
+}
+
 func TestExporterConvertsRawHTTPBodiesWithoutScribeDB(t *testing.T) {
 	requestBody := []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">\n<objective>\nExpose raw body conversion.\n</objective>\n</codex_internal_context>\nRun pwd."}]}]}`)
 	responseBody := []byte(`{"model":"gpt-5-codex","status":"requires_action","output":[{"type":"function_call","call_id":"call_exec_raw","name":"exec_command","arguments":{"cmd":"pwd"}}],"usage":{"input_tokens":10,"output_tokens":5}}`)
