@@ -3,13 +3,11 @@
 Agelish Teacher is a standalone Go binary that translates raw LLM provider HTTP
 traffic into OpenTelemetry GenAI spans for OTLP endpoints such as Langfuse.
 
-The core is a raw-body translator: given the request/response bodies of a
-provider HTTP call (Anthropic Messages, OpenAI/Codex Responses — JSON or SSE),
-it projects them into `gen_ai.*` spans and attributes. In principle any captured
-HTTP raw body from a supported provider can be fed through this mapping; it is
-not tied to Scribe. Scribe's SQLite trace database is simply the current
-ingestion source — it supplies the raw bodies (plus session/turn structure) that
-the translator consumes.
+The core input is a canonical raw HTTP envelope: captured request/response
+metadata plus the raw body bytes. Provider parsers then map Anthropic Messages,
+OpenAI-compatible Chat Completions, and OpenAI/Codex Responses JSON/SSE into
+`gen_ai.*` spans and attributes. It is not tied to Scribe. Scribe's SQLite trace
+database is one importer that supplies raw bodies plus session/turn structure.
 
 The converter is intentionally decoupled from any single capture tool. Scribe
 keeps faithful wire capture; this repo owns the experimental OTel GenAI mapping
@@ -18,8 +16,10 @@ churn and can be pointed at other raw-body sources over time.
 ## Current Scope
 
 - Reads Scribe tables: `sessions`, `turns`, `trace_requests`, `raw_payloads`.
-- Can also convert a single raw HTTP request/response body pair directly via
-  `-raw-provider`, `-raw-request`, and `-raw-response`, without Scribe.
+- Reads canonical raw HTTP envelope JSONL from `-raw-envelope` or
+  `-raw-envelope-stdin`, without Scribe.
+- Keeps the older single-pair convenience flags `-raw-provider`, `-raw-request`,
+  and `-raw-response`; internally these are wrapped into raw HTTP envelopes.
 - Decodes raw payloads stored as `identity` or `zstd`.
 - Reconstructs deterministic trace/span IDs from Scribe primary keys.
 - Emits one session span, one span per turn, one `SPAN_KIND_CLIENT` generation
@@ -54,10 +54,35 @@ go run ./cmd/agelish-teacher \
 Use `-format spans` when debugging Agelish Teacher's internal span model before
 OTLP JSON conversion.
 
-## Raw Body Mode
+## Raw HTTP Envelope Mode
+
+Use raw envelope mode when another process has captured HTTP request/response
+traffic and can provide correlation metadata:
+
+```jsonl
+{"source":"reasonix","request_id":"call-1","session_id":"sess-1","turn_id":"turn-1","direction":"request","method":"POST","url":"https://api.example.test/v1/chat/completions","headers":{"content-type":"application/json"},"body":"{\"model\":\"deepseek-v4-pro\",\"messages\":[{\"role\":\"user\",\"content\":\"Say ok.\"}]}","timestamp_ms":1710000000200}
+{"source":"reasonix","request_id":"call-1","session_id":"sess-1","turn_id":"turn-1","direction":"response","status_code":200,"headers":{"content-type":"application/json"},"body_text":"{\"model\":\"deepseek-v4-pro\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}","timestamp_ms":1710000001200}
+```
+
+```bash
+go run ./cmd/agelish-teacher \
+  -raw-envelope /path/to/envelopes.jsonl \
+  -format otlp-json \
+  -check-standard \
+  -out tmp/raw-envelope-otlp.json
+```
+
+The body can be supplied as `body`/`body_text` for UTF-8 JSON or SSE. Use
+`body_base64` for non-text bytes. If `provider` is omitted, Agelish infers
+OpenAI-compatible traffic from paths such as `/v1/chat/completions`; `source`
+is preserved for display, so a Reasonix OpenAI-compatible call appears as
+Reasonix while still using the OpenAI parser.
+
+## Raw Body Pair Mode
 
 Use raw body mode when another process already has provider HTTP bodies and only
-needs Agelish Teacher for parsing and OTLP projection:
+needs Agelish Teacher for parsing and OTLP projection. This is a compatibility
+wrapper around raw envelope mode:
 
 ```bash
 go run ./cmd/agelish-teacher \
@@ -70,10 +95,10 @@ go run ./cmd/agelish-teacher \
   -out tmp/raw-otlp.json
 ```
 
-Raw body mode still needs minimal correlation metadata. If `-raw-session-id` or
-`-raw-request-id` are omitted, Agelish Teacher generates local fallback IDs.
-For multi-turn trees, Scribe DB mode remains richer because it supplies
-session/turn/request lineage, timestamps, and paired tool results.
+Raw body pair mode still needs minimal correlation metadata. If
+`-raw-session-id` or `-raw-request-id` are omitted, Agelish Teacher generates
+local fallback IDs. For multi-turn trees, prefer raw envelope mode because it
+can carry session, turn, request, timestamp, URL, header, and status metadata.
 
 ## Send To Langfuse
 
