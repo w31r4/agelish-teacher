@@ -116,7 +116,9 @@ Agelish Teacher emits Langfuse display payloads at three levels:
   request input and latest response output observed in that Scribe turn.
 - Generation span:
   `langfuse.observation.input` and `langfuse.observation.output` are the paired
-  request payload and response payload for that model call.
+  request payload and response payload for that model call. Error generations
+  use a diagnostic output object, set `error.type`, and do not invent
+  `gen_ai.output.messages`.
 
 Tool observations use the tool-call arguments as `langfuse.observation.input`
 and the matching tool result as `langfuse.observation.output`. If Scribe captured

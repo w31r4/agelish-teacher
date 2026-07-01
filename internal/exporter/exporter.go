@@ -182,7 +182,14 @@ func ExportRawPair(opts RawPairOptions) (Result, error) {
 		rootAttrs["langfuse.observation.input"] = parsedRequest.InputMessages
 		turnAttrs["langfuse.observation.input"] = parsedRequest.InputMessages
 	}
-	if len(parsedResponse.OutputMessages) > 0 {
+	rawResponseIsError := parsedFinishReasonIsError(parsedResponse)
+	rawErrorType := "error"
+	if rawResponseIsError {
+		output := errorObservationOutput(traceRequestRow{}, rawErrorType, parsedResponse)
+		rootAttrs["langfuse.trace.output"] = output
+		rootAttrs["langfuse.observation.output"] = output
+		turnAttrs["langfuse.observation.output"] = output
+	} else if len(parsedResponse.OutputMessages) > 0 {
 		rootAttrs["langfuse.trace.output"] = parsedResponse.OutputMessages
 		rootAttrs["langfuse.observation.output"] = parsedResponse.OutputMessages
 		turnAttrs["langfuse.observation.output"] = parsedResponse.OutputMessages
@@ -217,7 +224,7 @@ func ExportRawPair(opts RawPairOptions) (Result, error) {
 		"session.id":                 sessionID,
 		"langfuse.session.id":        sessionID,
 		"langfuse.observation.type":  "generation",
-		"langfuse.observation.level": "DEFAULT",
+		"langfuse.observation.level": langfuseLevel(rawGenerationOutcome(rawResponseIsError)),
 		"langfuse.trace.name":        rootName,
 		"scribe.trace_request.id":    requestID,
 		"scribe.request_id":          requestID,
@@ -247,10 +254,20 @@ func ExportRawPair(opts RawPairOptions) (Result, error) {
 		attrs["gen_ai.prompt"] = mustJSON(parsedRequest.InputMessages)
 		attrs["langfuse.observation.input"] = parsedRequest.InputMessages
 	}
-	if len(parsedResponse.OutputMessages) > 0 {
+	if rawResponseIsError {
+		attrs["error.type"] = rawErrorType
+		if message := parsedResponseErrorMessage(parsedResponse); message != "" {
+			attrs["langfuse.observation.status_message"] = message
+		}
+		attrs["langfuse.observation.output"] = errorObservationOutput(traceRequestRow{}, rawErrorType, parsedResponse)
+	} else if len(parsedResponse.OutputMessages) > 0 {
 		attrs["gen_ai.output.messages"] = mustJSON(parsedResponse.OutputMessages)
 		attrs["gen_ai.completion"] = mustJSON(parsedResponse.OutputMessages)
 		attrs["langfuse.observation.output"] = parsedResponse.OutputMessages
+	}
+	status := otel.Status{Code: "STATUS_CODE_OK"}
+	if rawResponseIsError {
+		status = otel.Status{Code: "STATUS_CODE_ERROR", Message: parsedResponseErrorMessage(parsedResponse)}
 	}
 
 	nameModel := parsedResponse.Model
@@ -267,7 +284,7 @@ func ExportRawPair(opts RawPairOptions) (Result, error) {
 		StartUnixNano: msToNs(startMS),
 		EndUnixNano:   msToNs(endMS),
 		Attributes:    attrs,
-		Status:        otel.Status{Code: "STATUS_CODE_OK"},
+		Status:        status,
 	})
 
 	for index, call := range parsedResponse.ToolCalls {
@@ -317,7 +334,7 @@ func ExportRawPair(opts RawPairOptions) (Result, error) {
 			StartUnixNano: msToNs(startMS),
 			EndUnixNano:   msToNs(endMS),
 			Attributes:    toolAttrs,
-			Status:        otel.Status{Code: "STATUS_CODE_OK"},
+			Status:        status,
 		})
 	}
 
@@ -738,7 +755,7 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 		if output := controlOutputPayload(response, summaries); len(output) > 0 {
 			attrs["langfuse.observation.output"] = output
 		}
-		status := responseStatus(response)
+		status := responseStatus(response, provider.ParsedPayload{})
 		return []otel.Span{{
 			TraceID:       traceID,
 			SpanID:        spanID,
@@ -800,21 +817,22 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 		attrs["gen_ai.prompt"] = mustJSON(parsedRequest.InputMessages)
 		attrs["langfuse.observation.input"] = parsedRequest.InputMessages
 	}
-	if isErrorResponse(response) {
+	responseIsError := isGenerationErrorResponse(response, parsedResponse)
+	if responseIsError {
 		errorType := generationErrorType(response)
 		attrs["error.type"] = errorType
-		if response.ErrorMessage.Valid && response.ErrorMessage.String != "" {
-			attrs["langfuse.observation.status_message"] = response.ErrorMessage.String
+		if message := generationErrorMessage(response, parsedResponse); message != "" {
+			attrs["langfuse.observation.status_message"] = message
 		}
-		attrs["langfuse.observation.output"] = errorObservationOutput(response, errorType)
+		attrs["langfuse.observation.output"] = errorObservationOutput(response, errorType, parsedResponse)
 	}
-	if !isErrorResponse(response) && len(parsedResponse.OutputMessages) > 0 {
+	if !responseIsError && len(parsedResponse.OutputMessages) > 0 {
 		attrs["gen_ai.output.messages"] = mustJSON(parsedResponse.OutputMessages)
 		attrs["gen_ai.completion"] = mustJSON(parsedResponse.OutputMessages)
 		attrs["langfuse.observation.output"] = parsedResponse.OutputMessages
 	}
 
-	status := responseStatus(response)
+	status := responseStatus(response, parsedResponse)
 	nameModel := response.Model
 	if nameModel == "" || nameModel == "unknown" {
 		nameModel = parsedResponse.Model
@@ -1158,12 +1176,12 @@ func shouldCreateAgentSpan(role string, fineRole string) bool {
 	return strings.Contains(fineRole, "subagent")
 }
 
-func responseStatus(response traceRequestRow) otel.Status {
+func responseStatus(response traceRequestRow, parsedResponse provider.ParsedPayload) otel.Status {
 	status := otel.Status{}
-	if isErrorResponse(response) {
+	if isGenerationErrorResponse(response, parsedResponse) {
 		status.Code = "STATUS_CODE_ERROR"
-		if response.ErrorMessage.Valid {
-			status.Message = response.ErrorMessage.String
+		if message := generationErrorMessage(response, parsedResponse); message != "" {
+			status.Message = message
 		}
 	} else {
 		status.Code = "STATUS_CODE_OK"
@@ -1173,6 +1191,27 @@ func responseStatus(response traceRequestRow) otel.Status {
 
 func isErrorResponse(response traceRequestRow) bool {
 	return response.Outcome == "error" || (response.HTTPStatus.Valid && response.HTTPStatus.Int64 >= 400)
+}
+
+func isGenerationErrorResponse(response traceRequestRow, parsedResponse provider.ParsedPayload) bool {
+	return isErrorResponse(response) || parsedFinishReasonIsError(parsedResponse)
+}
+
+func parsedFinishReasonIsError(parsedResponse provider.ParsedPayload) bool {
+	for _, reason := range parsedResponse.FinishReasons {
+		switch strings.ToLower(strings.TrimSpace(reason)) {
+		case "error", "failed", "failure":
+			return true
+		}
+	}
+	return false
+}
+
+func rawGenerationOutcome(isError bool) string {
+	if isError {
+		return "error"
+	}
+	return "ok"
 }
 
 func generationErrorType(response traceRequestRow) string {
@@ -1233,15 +1272,42 @@ func normalizeErrorType(value string) string {
 	return strings.Trim(b.String(), "_")
 }
 
-func errorObservationOutput(response traceRequestRow, errorType string) map[string]any {
+func generationErrorMessage(response traceRequestRow, parsedResponse provider.ParsedPayload) string {
+	if response.ErrorMessage.Valid && response.ErrorMessage.String != "" {
+		return response.ErrorMessage.String
+	}
+	if message := parsedResponseErrorMessage(parsedResponse); message != "" {
+		return message
+	}
+	if response.HTTPStatus.Valid {
+		return fmt.Sprintf("HTTP %d", response.HTTPStatus.Int64)
+	}
+	return ""
+}
+
+func parsedResponseErrorMessage(parsedResponse provider.ParsedPayload) string {
+	for _, message := range parsedResponse.OutputMessages {
+		for _, part := range message.Parts {
+			if part.Type == "text" {
+				if text, ok := part.Content.(string); ok && text != "" {
+					return text
+				}
+			}
+		}
+		if text, ok := message.Content.(string); ok && text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func errorObservationOutput(response traceRequestRow, errorType string, parsedResponse provider.ParsedPayload) map[string]any {
 	output := map[string]any{
 		"status":     "error",
 		"error_type": errorType,
 	}
-	if response.ErrorMessage.Valid && response.ErrorMessage.String != "" {
-		output["message"] = response.ErrorMessage.String
-	} else if response.HTTPStatus.Valid {
-		output["message"] = fmt.Sprintf("HTTP %d", response.HTTPStatus.Int64)
+	if message := generationErrorMessage(response, parsedResponse); message != "" {
+		output["message"] = message
 	}
 	if response.HTTPStatus.Valid {
 		output["http_status"] = response.HTTPStatus.Int64

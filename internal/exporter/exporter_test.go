@@ -288,6 +288,30 @@ func TestExporterConvertsRawHTTPBodiesWithoutScribeDB(t *testing.T) {
 	assertAttr(t, tool.Attributes, "langfuse.trace.name", "Codex - Session raw_codex_se")
 }
 
+func TestExporterConvertsRawHTTPErrorBodyAsDiagnosticGeneration(t *testing.T) {
+	result, err := ExportRawPair(RawPairOptions{
+		Provider:     "codex",
+		RequestBody:  []byte(`{"model":"gpt-5.5","input":"Run audit."}`),
+		ResponseBody: []byte(`{"detail":"The requested model requires a newer version of Codex."}`),
+		SessionID:    "raw_error_session",
+		RequestID:    "raw_error_call",
+	})
+	if err != nil {
+		t.Fatalf("export raw pair: %v", err)
+	}
+
+	generation := findSpanByAttr(t, result.Spans, "langfuse.observation.type", "generation")
+	if generation.Status.Code != "STATUS_CODE_ERROR" {
+		t.Fatalf("expected error status, got %#v", generation.Status)
+	}
+	assertAttr(t, generation.Attributes, "error.type", "error")
+	assertAttrJSONContains(t, generation.Attributes, "langfuse.observation.output", `"status":"error"`)
+	assertAttrJSONContains(t, generation.Attributes, "langfuse.observation.output", `"message":"The requested model requires a newer version of Codex."`)
+	if _, ok := generation.Attributes["gen_ai.output.messages"]; ok {
+		t.Fatalf("raw error generation must not invent gen_ai.output.messages: %#v", generation.Attributes["gen_ai.output.messages"])
+	}
+}
+
 func TestExporterAddsLangfuseInputOutputAndToolResultOutput(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "traces.db")
 	db, err := sql.Open("sqlite", dbPath)
