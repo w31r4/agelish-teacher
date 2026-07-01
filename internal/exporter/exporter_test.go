@@ -158,12 +158,91 @@ func TestExporterNamesCodexObservationsForLangfuseTree(t *testing.T) {
 		t.Fatalf("generation name mismatch: %q", generation.Name)
 	}
 	assertAttr(t, generation.Attributes, "gen_ai.provider.name", "codex")
+	assertAttr(t, generation.Attributes, "langfuse.trace.name", "Codex - Session 019f1d000000")
 
 	tool := findSpanByAttr(t, result.Spans, "gen_ai.tool.call.id", "call_exec_1")
 	if tool.Name != "Shell command" {
 		t.Fatalf("tool name mismatch: %q", tool.Name)
 	}
 	assertAttr(t, tool.Attributes, "gen_ai.tool.name", "exec_command")
+	assertAttr(t, tool.Attributes, "scribe.tool.name", "exec_command")
+	assertAttr(t, tool.Attributes, "langfuse.trace.name", "Codex - Session 019f1d000000")
+}
+
+func TestExporterAddsCodexGoalContextAttributes(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "traces.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	createScribeSchema(t, db)
+
+	insertSession(t, db, "sess_goal", "codex", 1710000000000, 1710000004000)
+	insertTurn(t, db, "turn_goal", "sess_goal", 1, "completed", 1710000000100, 1710000003000)
+	insertTraceRequest(t, db, traceRow{
+		ID: "req_goal", SessionID: "sess_goal", TurnID: "turn_goal", RequestID: "call_goal",
+		Direction: "request", Provider: "codex", Model: "gpt-5-codex", Timestamp: 1710000000200,
+	})
+	insertTraceRequest(t, db, traceRow{
+		ID: "resp_goal", SessionID: "sess_goal", TurnID: "turn_goal", RequestID: "call_goal",
+		Direction: "response", Provider: "codex", Model: "gpt-5-codex", Timestamp: 1710000001200,
+		Outcome: "ok", HTTPStatus: 200, StopReason: "completed",
+	})
+	insertRawPayload(t, db, "raw_req_goal", "req_goal", "identity", []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">\n<objective>\nMake Codex traces readable.\n</objective>\n</codex_internal_context>\nContinue."}]}]}`))
+	insertRawPayload(t, db, "raw_resp_goal", "resp_goal", "identity", []byte(`{"model":"gpt-5-codex","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Done."}]}]}`))
+
+	result, err := Export(context.Background(), Options{DBPath: dbPath})
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+
+	generation := findSpanByAttr(t, result.Spans, "langfuse.observation.type", "generation")
+	assertAttr(t, generation.Attributes, "scribe.codex.goal.present", true)
+	assertAttr(t, generation.Attributes, "scribe.codex.goal.objective", "Make Codex traces readable.")
+	assertAttr(t, generation.Attributes, "scribe.codex.internal_context.sources", []string{"goal"})
+}
+
+func TestExporterConvertsRawHTTPBodiesWithoutScribeDB(t *testing.T) {
+	requestBody := []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">\n<objective>\nExpose raw body conversion.\n</objective>\n</codex_internal_context>\nRun pwd."}]}]}`)
+	responseBody := []byte(`{"model":"gpt-5-codex","status":"requires_action","output":[{"type":"function_call","call_id":"call_exec_raw","name":"exec_command","arguments":{"cmd":"pwd"}}],"usage":{"input_tokens":10,"output_tokens":5}}`)
+
+	result, err := ExportRawPair(RawPairOptions{
+		Provider:     "codex",
+		RequestBody:  requestBody,
+		ResponseBody: responseBody,
+		SessionID:    "raw_codex_session",
+		RequestID:    "raw_call_1",
+	})
+	if err != nil {
+		t.Fatalf("export raw pair: %v", err)
+	}
+	if len(result.Spans) != 4 {
+		t.Fatalf("expected session, turn, generation, tool spans; got %d: %#v", len(result.Spans), result.Spans)
+	}
+
+	session := findSpanByAttr(t, result.Spans, "scribe.session.id", "raw_codex_session")
+	if session.Name != "Codex - Session raw_codex_se" {
+		t.Fatalf("session name mismatch: %q", session.Name)
+	}
+
+	generation := findSpanByAttr(t, result.Spans, "langfuse.observation.type", "generation")
+	if generation.Name != "Codex gpt-5-codex" {
+		t.Fatalf("generation name mismatch: %q", generation.Name)
+	}
+	assertAttr(t, generation.Attributes, "gen_ai.provider.name", "codex")
+	assertAttr(t, generation.Attributes, "gen_ai.request.model", "gpt-5-codex")
+	assertAttr(t, generation.Attributes, "gen_ai.response.model", "gpt-5-codex")
+	assertAttr(t, generation.Attributes, "langfuse.trace.name", "Codex - Session raw_codex_se")
+	assertAttr(t, generation.Attributes, "scribe.codex.goal.objective", "Expose raw body conversion.")
+
+	tool := findSpanByAttr(t, result.Spans, "gen_ai.tool.call.id", "call_exec_raw")
+	if tool.Name != "Shell command" {
+		t.Fatalf("tool name mismatch: %q", tool.Name)
+	}
+	assertAttr(t, tool.Attributes, "gen_ai.tool.name", "exec_command")
+	assertAttr(t, tool.Attributes, "scribe.tool.name", "exec_command")
+	assertAttr(t, tool.Attributes, "langfuse.trace.name", "Codex - Session raw_codex_se")
 }
 
 func TestExporterAddsLangfuseInputOutputAndToolResultOutput(t *testing.T) {
@@ -321,6 +400,7 @@ func TestExporterMapsCodexModelProbeToControlSpanNotGeneration(t *testing.T) {
 	if control.Name != "Codex model probe" {
 		t.Fatalf("control name mismatch: %q", control.Name)
 	}
+	assertAttr(t, control.Attributes, "langfuse.trace.name", "Codex - Session sess_probe")
 	if control.Kind != "SPAN_KIND_INTERNAL" {
 		t.Fatalf("control span kind mismatch: %s", control.Kind)
 	}

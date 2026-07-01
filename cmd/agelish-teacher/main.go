@@ -24,6 +24,12 @@ func main() {
 	var langfuseURL string
 	var publicKey string
 	var secretKey string
+	var rawProvider string
+	var rawSource string
+	var rawRequestPath string
+	var rawResponsePath string
+	var rawSessionID string
+	var rawRequestID string
 
 	flag.StringVar(&dbPath, "db", "", "Scribe SQLite DB path; defaults to ~/.scribe/traces.db")
 	flag.StringVar(&sessionID, "session", "", "export only one Scribe session id")
@@ -35,13 +41,25 @@ func main() {
 	flag.StringVar(&langfuseURL, "langfuse-url", os.Getenv("LANGFUSE_BASE_URL"), "Langfuse base URL")
 	flag.StringVar(&publicKey, "langfuse-public-key", os.Getenv("LANGFUSE_PUBLIC_KEY"), "Langfuse public key")
 	flag.StringVar(&secretKey, "langfuse-secret-key", os.Getenv("LANGFUSE_SECRET_KEY"), "Langfuse secret key")
+	flag.StringVar(&rawProvider, "raw-provider", "", "provider for raw HTTP body conversion, e.g. codex, anthropic, openai")
+	flag.StringVar(&rawSource, "raw-source", "", "source label for raw HTTP body conversion; defaults to raw-provider")
+	flag.StringVar(&rawRequestPath, "raw-request", "", "path to a raw HTTP request body JSON/SSE file")
+	flag.StringVar(&rawResponsePath, "raw-response", "", "path to a raw HTTP response body JSON/SSE file")
+	flag.StringVar(&rawSessionID, "raw-session-id", "", "session id for raw HTTP body conversion")
+	flag.StringVar(&rawRequestID, "raw-request-id", "", "request id for raw HTTP body conversion")
 	flag.Parse()
 
 	ctx := context.Background()
-	result, err := exporter.Export(ctx, exporter.Options{
-		DBPath:        dbPath,
-		SessionID:     sessionID,
-		IncludeActive: includeActive,
+	result, err := exportResult(ctx, exportConfig{
+		DBPath:          dbPath,
+		SessionID:       sessionID,
+		IncludeActive:   includeActive,
+		RawProvider:     rawProvider,
+		RawSource:       rawSource,
+		RawRequestPath:  rawRequestPath,
+		RawResponsePath: rawResponsePath,
+		RawSessionID:    rawSessionID,
+		RawRequestID:    rawRequestID,
 	})
 	if err != nil {
 		fatal(err)
@@ -99,4 +117,49 @@ func main() {
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "agelish-teacher:", err)
 	os.Exit(1)
+}
+
+type exportConfig struct {
+	DBPath          string
+	SessionID       string
+	IncludeActive   bool
+	RawProvider     string
+	RawSource       string
+	RawRequestPath  string
+	RawResponsePath string
+	RawSessionID    string
+	RawRequestID    string
+}
+
+func exportResult(ctx context.Context, cfg exportConfig) (exporter.Result, error) {
+	if cfg.RawProvider != "" || cfg.RawRequestPath != "" || cfg.RawResponsePath != "" {
+		requestBody, err := readOptionalFile(cfg.RawRequestPath)
+		if err != nil {
+			return exporter.Result{}, fmt.Errorf("read raw request: %w", err)
+		}
+		responseBody, err := readOptionalFile(cfg.RawResponsePath)
+		if err != nil {
+			return exporter.Result{}, fmt.Errorf("read raw response: %w", err)
+		}
+		return exporter.ExportRawPair(exporter.RawPairOptions{
+			Provider:     cfg.RawProvider,
+			Source:       cfg.RawSource,
+			SessionID:    cfg.RawSessionID,
+			RequestID:    cfg.RawRequestID,
+			RequestBody:  requestBody,
+			ResponseBody: responseBody,
+		})
+	}
+	return exporter.Export(ctx, exporter.Options{
+		DBPath:        cfg.DBPath,
+		SessionID:     cfg.SessionID,
+		IncludeActive: cfg.IncludeActive,
+	})
+}
+
+func readOptionalFile(path string) ([]byte, error) {
+	if path == "" {
+		return nil, nil
+	}
+	return os.ReadFile(path)
 }

@@ -18,6 +18,8 @@ churn and can be pointed at other raw-body sources over time.
 ## Current Scope
 
 - Reads Scribe tables: `sessions`, `turns`, `trace_requests`, `raw_payloads`.
+- Can also convert a single raw HTTP request/response body pair directly via
+  `-raw-provider`, `-raw-request`, and `-raw-response`, without Scribe.
 - Decodes raw payloads stored as `identity` or `zstd`.
 - Reconstructs deterministic trace/span IDs from Scribe primary keys.
 - Emits one session span, one span per turn, one `SPAN_KIND_CLIENT` generation
@@ -51,6 +53,27 @@ go run ./cmd/agelish-teacher \
 
 Use `-format spans` when debugging Agelish Teacher's internal span model before
 OTLP JSON conversion.
+
+## Raw Body Mode
+
+Use raw body mode when another process already has provider HTTP bodies and only
+needs Agelish Teacher for parsing and OTLP projection:
+
+```bash
+go run ./cmd/agelish-teacher \
+  -raw-provider codex \
+  -raw-request /path/to/request-body.json \
+  -raw-response /path/to/response-body.json-or-sse \
+  -raw-session-id external-session-1 \
+  -format otlp-json \
+  -check-standard \
+  -out tmp/raw-otlp.json
+```
+
+Raw body mode still needs minimal correlation metadata. If `-raw-session-id` or
+`-raw-request-id` are omitted, Agelish Teacher generates local fallback IDs.
+For multi-turn trees, Scribe DB mode remains richer because it supplies
+session/turn/request lineage, timestamps, and paired tool results.
 
 ## Send To Langfuse
 
