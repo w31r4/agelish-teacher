@@ -169,6 +169,56 @@ func TestExporterNamesCodexObservationsForLangfuseTree(t *testing.T) {
 	assertAttr(t, tool.Attributes, "langfuse.trace.name", "Codex - Session 019f1d000000")
 }
 
+func TestExporterUsesScribePlatformAndOperationNameForOpenAICompatibleRequests(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "traces.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	createScribeSchema(t, db)
+
+	summary := `{
+		"platform": "reasonix",
+		"protocol": "openai.chat_completions",
+		"operation_name": "Reasonix Chat Completions"
+	}`
+	insertSession(t, db, "sess_reasonix", "reasonix", 1710000000000, 1710000004000)
+	insertTurn(t, db, "turn_reasonix", "sess_reasonix", 1, "completed", 1710000000100, 1710000003000)
+	insertTraceRequest(t, db, traceRow{
+		ID: "req_reasonix", SessionID: "sess_reasonix", TurnID: "turn_reasonix", RequestID: "call_reasonix",
+		Direction: "request", Provider: "openai", Model: "deepseek-v4-pro", Timestamp: 1710000000200,
+		Summary: summary,
+	})
+	insertTraceRequest(t, db, traceRow{
+		ID: "resp_reasonix", SessionID: "sess_reasonix", TurnID: "turn_reasonix", RequestID: "call_reasonix",
+		Direction: "response", Provider: "openai", Model: "deepseek-v4-pro", Timestamp: 1710000001200,
+		Outcome: "ok", HTTPStatus: 200, StopReason: "stop", InputTokens: ptr(1), OutputTokens: ptr(1),
+		Summary: summary,
+	})
+	insertRawPayload(t, db, "raw_req_reasonix", "req_reasonix", "identity", []byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":"Say ok."}]}`))
+	insertRawPayload(t, db, "raw_resp_reasonix", "resp_reasonix", "identity", []byte(`{"model":"deepseek-v4-pro","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+
+	result, err := Export(context.Background(), Options{DBPath: dbPath})
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+
+	generation := findSpanByAttr(t, result.Spans, "langfuse.observation.type", "generation")
+	if generation.Name != "Reasonix Chat Completions" {
+		t.Fatalf("generation name mismatch: %q", generation.Name)
+	}
+	assertAttr(t, generation.Attributes, "gen_ai.provider.name", "reasonix")
+	assertAttr(t, generation.Attributes, "scribe.provider.name", "openai")
+	assertAttr(t, generation.Attributes, "scribe.platform", "reasonix")
+	assertAttr(t, generation.Attributes, "scribe.protocol", "openai.chat_completions")
+	assertAttr(t, generation.Attributes, "scribe.operation.name", "Reasonix Chat Completions")
+	assertAttr(t, generation.Attributes, "gen_ai.request.model", "deepseek-v4-pro")
+	assertAttr(t, generation.Attributes, "gen_ai.response.model", "deepseek-v4-pro")
+	assertAttrJSONContains(t, generation.Attributes, "langfuse.observation.output", "assistant")
+	assertAttrJSONContains(t, generation.Attributes, "langfuse.observation.output", "ok")
+}
+
 func TestExporterAddsCodexGoalContextAttributes(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "traces.db")
 	db, err := sql.Open("sqlite", dbPath)
