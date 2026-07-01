@@ -800,13 +800,18 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 		attrs["gen_ai.prompt"] = mustJSON(parsedRequest.InputMessages)
 		attrs["langfuse.observation.input"] = parsedRequest.InputMessages
 	}
-	if len(parsedResponse.OutputMessages) > 0 {
+	if isErrorResponse(response) {
+		errorType := generationErrorType(response)
+		attrs["error.type"] = errorType
+		if response.ErrorMessage.Valid && response.ErrorMessage.String != "" {
+			attrs["langfuse.observation.status_message"] = response.ErrorMessage.String
+		}
+		attrs["langfuse.observation.output"] = errorObservationOutput(response, errorType)
+	}
+	if !isErrorResponse(response) && len(parsedResponse.OutputMessages) > 0 {
 		attrs["gen_ai.output.messages"] = mustJSON(parsedResponse.OutputMessages)
 		attrs["gen_ai.completion"] = mustJSON(parsedResponse.OutputMessages)
 		attrs["langfuse.observation.output"] = parsedResponse.OutputMessages
-	}
-	if response.ErrorMessage.Valid && response.ErrorMessage.String != "" {
-		attrs["langfuse.observation.status_message"] = response.ErrorMessage.String
 	}
 
 	status := responseStatus(response)
@@ -1155,7 +1160,7 @@ func shouldCreateAgentSpan(role string, fineRole string) bool {
 
 func responseStatus(response traceRequestRow) otel.Status {
 	status := otel.Status{}
-	if response.Outcome == "error" || (response.HTTPStatus.Valid && response.HTTPStatus.Int64 >= 400) {
+	if isErrorResponse(response) {
 		status.Code = "STATUS_CODE_ERROR"
 		if response.ErrorMessage.Valid {
 			status.Message = response.ErrorMessage.String
@@ -1164,6 +1169,84 @@ func responseStatus(response traceRequestRow) otel.Status {
 		status.Code = "STATUS_CODE_OK"
 	}
 	return status
+}
+
+func isErrorResponse(response traceRequestRow) bool {
+	return response.Outcome == "error" || (response.HTTPStatus.Valid && response.HTTPStatus.Int64 >= 400)
+}
+
+func generationErrorType(response traceRequestRow) string {
+	if response.ErrorType.Valid {
+		if normalized := normalizeErrorType(response.ErrorType.String); normalized != "" {
+			return normalized
+		}
+	}
+	if response.HTTPStatus.Valid && response.HTTPStatus.Int64 >= 400 {
+		switch response.HTTPStatus.Int64 {
+		case 502:
+			return "http_502"
+		case 503:
+			return "http_503"
+		case 504:
+			return "http_504"
+		default:
+			if response.HTTPStatus.Int64 >= 500 {
+				return "http_5xx"
+			}
+			return "http_4xx"
+		}
+	}
+	message := strings.ToLower(response.ErrorMessage.String)
+	switch {
+	case strings.Contains(message, "connection reset"):
+		return "connection_reset"
+	case strings.Contains(message, "cannot connect"), strings.Contains(message, "connect to host"):
+		return "connect_error"
+	case strings.Contains(message, "timeout"), strings.Contains(message, "timed out"), strings.Contains(message, "deadline exceeded"):
+		return "timeout"
+	case strings.Contains(message, "upstream"), strings.Contains(message, "bad gateway"):
+		return "upstream_error"
+	default:
+		return "error"
+	}
+}
+
+func normalizeErrorType(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return ""
+	}
+	var b strings.Builder
+	lastUnderscore := false
+	for _, r := range value {
+		isWord := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if isWord {
+			b.WriteRune(r)
+			lastUnderscore = false
+			continue
+		}
+		if !lastUnderscore {
+			b.WriteByte('_')
+			lastUnderscore = true
+		}
+	}
+	return strings.Trim(b.String(), "_")
+}
+
+func errorObservationOutput(response traceRequestRow, errorType string) map[string]any {
+	output := map[string]any{
+		"status":     "error",
+		"error_type": errorType,
+	}
+	if response.ErrorMessage.Valid && response.ErrorMessage.String != "" {
+		output["message"] = response.ErrorMessage.String
+	} else if response.HTTPStatus.Valid {
+		output["message"] = fmt.Sprintf("HTTP %d", response.HTTPStatus.Int64)
+	}
+	if response.HTTPStatus.Valid {
+		output["http_status"] = response.HTTPStatus.Int64
+	}
+	return output
 }
 
 func agentObservationName(role string, fineRole string) string {
