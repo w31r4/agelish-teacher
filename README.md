@@ -1,7 +1,8 @@
 # Agelish Teacher
 
-Agelish Teacher is a standalone Go binary that translates raw LLM provider HTTP
-traffic into OpenTelemetry GenAI spans for OTLP endpoints such as Langfuse.
+Agelish Teacher is a standalone Go binary and lightweight middleware for
+turning raw LLM provider HTTP traffic into OpenTelemetry GenAI spans for OTLP
+endpoints such as Langfuse.
 
 The core input is a canonical raw HTTP envelope: captured request/response
 metadata plus the raw body bytes. Provider parsers then map Anthropic Messages,
@@ -12,6 +13,39 @@ database is one importer that supplies raw bodies plus session/turn structure.
 The converter is intentionally decoupled from any single capture tool. Scribe
 keeps faithful wire capture; this repo owns the experimental OTel GenAI mapping
 churn and can be pointed at other raw-body sources over time.
+
+## Middleware Contract
+
+Agelish Teacher's stable boundary is raw HTTP capture, not any one tracing
+database schema:
+
+```text
+HTTP raw capture / envelope
+  -> request-response correlation
+  -> provider parser
+  -> OTel GenAI spans
+  -> OTLP HTTP/JSON
+  -> Langfuse
+```
+
+This means Scribe is just one importer. A Scribe DB export, a JSONL file from a
+proxy, stdin from another process, or a future hosted collector should all feed
+the same canonical raw HTTP envelope shape before provider-specific parsing.
+
+The current implementation is usable as an offline/CLI middleware:
+
+- `-raw-envelope` and `-raw-envelope-stdin` accept canonical raw HTTP envelope
+  JSONL.
+- `-raw-provider`, `-raw-request`, and `-raw-response` remain as a single-call
+  compatibility wrapper.
+- `-db` reads Scribe's SQLite rows, decodes `raw_payloads`, and routes them
+  through the same body-based span builder.
+- `-send` forwards the generated OTLP HTTP/JSON payload to Langfuse.
+
+Planned but not implemented in this binary yet: a long-running HTTP ingest
+server, queue/backpressure controls, and chunk-level streaming updates. Today,
+streaming provider responses are parsed after the captured raw response body is
+available.
 
 ## Current Scope
 
