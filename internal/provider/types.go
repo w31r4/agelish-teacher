@@ -160,8 +160,8 @@ func usageFrom(raw any) Usage {
 		return Usage{}
 	}
 	usage := Usage{
-		InputTokens:         asInt64(usageObj["input_tokens"]),
-		OutputTokens:        asInt64(usageObj["output_tokens"]),
+		InputTokens:         firstInt(usageObj["input_tokens"], usageObj["prompt_tokens"]),
+		OutputTokens:        firstInt(usageObj["output_tokens"], usageObj["completion_tokens"]),
 		CacheReadTokens:     firstInt(usageObj["cache_read_tokens"], usageObj["cache_read_input_tokens"]),
 		CacheCreationTokens: firstInt(usageObj["cache_creation_tokens"], usageObj["cache_creation_input_tokens"]),
 		ReasoningTokens:     asInt64(usageObj["reasoning_tokens"]),
@@ -176,7 +176,20 @@ func usageFrom(raw any) Usage {
 			usage.ReasoningTokens = asInt64(details["reasoning_tokens"])
 		}
 	}
+	if usage.ReasoningTokens == nil {
+		if details, ok := usageObj["completion_tokens_details"].(map[string]any); ok {
+			usage.ReasoningTokens = asInt64(details["reasoning_tokens"])
+		}
+	}
 	return usage
+}
+
+func (usage Usage) isZero() bool {
+	return usage.InputTokens == nil &&
+		usage.OutputTokens == nil &&
+		usage.CacheReadTokens == nil &&
+		usage.CacheCreationTokens == nil &&
+		usage.ReasoningTokens == nil
 }
 
 func firstInt(values ...any) *int64 {

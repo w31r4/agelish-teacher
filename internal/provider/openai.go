@@ -75,9 +75,14 @@ func parseOpenAIResponse(body []byte) (ParsedPayload, error) {
 	var streamOutput []any
 	streamOutputByID := map[string]int{}
 	argumentsByItemID := map[string]any{}
+	var chatStream openAIChatCompletionStream
 	for _, event := range parseSSE(body) {
 		data, ok := eventObject(event)
 		if !ok {
+			continue
+		}
+		if isOpenAIChatCompletionChunk(data) {
+			chatStream.add(data)
 			continue
 		}
 		typ := eventType(event, data)
@@ -123,7 +128,86 @@ func parseOpenAIResponse(body []byte) (ParsedPayload, error) {
 	if len(streamOutput) > 0 {
 		return parseOpenAIResponseObject(map[string]any{"output": streamOutput}), nil
 	}
+	if chatStream.seen {
+		return chatStream.parsed(), nil
+	}
 	return ParsedPayload{}, nil
+}
+
+type openAIChatCompletionStream struct {
+	seen          bool
+	model         string
+	content       strings.Builder
+	reasoning     strings.Builder
+	usage         Usage
+	finishReasons []string
+}
+
+func isOpenAIChatCompletionChunk(data map[string]any) bool {
+	if object, ok := data["object"].(string); ok && object == "chat.completion.chunk" {
+		return true
+	}
+	choices, hasChoices := data["choices"].([]any)
+	return hasChoices && len(choices) > 0 && data["response"] == nil && data["output"] == nil
+}
+
+func (stream *openAIChatCompletionStream) add(data map[string]any) {
+	stream.seen = true
+	if model := firstString(data["model"]); model != "" {
+		stream.model = model
+	}
+	if usage := usageFrom(data["usage"]); !usage.isZero() {
+		stream.usage = usage
+	}
+	choices, _ := data["choices"].([]any)
+	for _, rawChoice := range choices {
+		choice, ok := rawChoice.(map[string]any)
+		if !ok {
+			continue
+		}
+		if finish := firstString(choice["finish_reason"]); finish != "" {
+			stream.appendFinishReason(finish)
+		}
+		delta, ok := choice["delta"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if text := firstString(delta["reasoning_content"], delta["reasoning"]); text != "" {
+			stream.reasoning.WriteString(text)
+		}
+		if text := firstString(delta["content"]); text != "" {
+			stream.content.WriteString(text)
+		}
+	}
+}
+
+func (stream *openAIChatCompletionStream) appendFinishReason(reason string) {
+	for _, existing := range stream.finishReasons {
+		if existing == reason {
+			return
+		}
+	}
+	stream.finishReasons = append(stream.finishReasons, reason)
+}
+
+func (stream openAIChatCompletionStream) parsed() ParsedPayload {
+	parsed := ParsedPayload{
+		Model:         stream.model,
+		Usage:         stream.usage,
+		FinishReasons: stream.finishReasons,
+	}
+	var parts []Part
+	if reasoning := stream.reasoning.String(); reasoning != "" {
+		parsed.Reasoning = append(parsed.Reasoning, reasoning)
+		parts = append(parts, reasoningPart(reasoning))
+	}
+	if content := stream.content.String(); content != "" {
+		parts = append(parts, textPart(content))
+	}
+	if len(parts) > 0 {
+		parsed.OutputMessages = append(parsed.OutputMessages, Message{Role: "assistant", Parts: parts})
+	}
+	return parsed
 }
 
 func appendOpenAIStreamOutputItem(output *[]any, byID map[string]int, item map[string]any) {
