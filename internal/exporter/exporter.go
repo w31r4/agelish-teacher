@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,8 @@ import (
 )
 
 type Span = otel.Span
+
+var volatileObjectRefPattern = regexp.MustCompile(`\s+[A-Za-z_][A-Za-z0-9_]*:<[^>]*\sobject at 0x[0-9a-fA-F]+>`)
 
 type Options struct {
 	DBPath        string
@@ -334,7 +337,7 @@ func ExportRawPair(opts RawPairOptions) (Result, error) {
 			StartUnixNano: msToNs(startMS),
 			EndUnixNano:   msToNs(endMS),
 			Attributes:    toolAttrs,
-			Status:        status,
+			Status:        otel.Status{Code: "STATUS_CODE_OK"},
 		})
 	}
 
@@ -1273,6 +1276,10 @@ func normalizeErrorType(value string) string {
 }
 
 func generationErrorMessage(response traceRequestRow, parsedResponse provider.ParsedPayload) string {
+	return displayErrorMessage(rawGenerationErrorMessage(response, parsedResponse))
+}
+
+func rawGenerationErrorMessage(response traceRequestRow, parsedResponse provider.ParsedPayload) string {
 	if response.ErrorMessage.Valid && response.ErrorMessage.String != "" {
 		return response.ErrorMessage.String
 	}
@@ -1283,6 +1290,19 @@ func generationErrorMessage(response traceRequestRow, parsedResponse provider.Pa
 		return fmt.Sprintf("HTTP %d", response.HTTPStatus.Int64)
 	}
 	return ""
+}
+
+func displayErrorMessage(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	sanitized := volatileObjectRefPattern.ReplaceAllString(raw, "")
+	sanitized = strings.Join(strings.Fields(sanitized), " ")
+	if sanitized == "" {
+		return raw
+	}
+	return sanitized
 }
 
 func parsedResponseErrorMessage(parsedResponse provider.ParsedPayload) string {
@@ -1306,8 +1326,13 @@ func errorObservationOutput(response traceRequestRow, errorType string, parsedRe
 		"status":     "error",
 		"error_type": errorType,
 	}
-	if message := generationErrorMessage(response, parsedResponse); message != "" {
+	rawMessage := rawGenerationErrorMessage(response, parsedResponse)
+	message := displayErrorMessage(rawMessage)
+	if message != "" {
 		output["message"] = message
+	}
+	if rawMessage != "" && rawMessage != message {
+		output["raw_message"] = rawMessage
 	}
 	if response.HTTPStatus.Valid {
 		output["http_status"] = response.HTTPStatus.Int64
