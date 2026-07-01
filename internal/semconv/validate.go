@@ -31,6 +31,7 @@ func ValidateSpans(spans []otel.Span) []Finding {
 
 func validateGenerationSpan(span otel.Span) []Finding {
 	var findings []Finding
+	isError := isErrorGeneration(span)
 	if span.Kind != "SPAN_KIND_CLIENT" {
 		findings = append(findings, Finding{
 			SpanID:  span.SpanID,
@@ -48,6 +49,19 @@ func validateGenerationSpan(span otel.Span) []Finding {
 			findings = append(findings, missing(span, key))
 		}
 	}
+	if isError {
+		if span.Status.Code != "STATUS_CODE_ERROR" {
+			findings = append(findings, Finding{
+				SpanID:  span.SpanID,
+				Message: "error generation span status should be STATUS_CODE_ERROR",
+			})
+		}
+		if isEmpty(span.Attributes["error.type"]) {
+			findings = append(findings, missing(span, "error.type"))
+		}
+	} else if isEmpty(span.Attributes["gen_ai.output.messages"]) {
+		findings = append(findings, missing(span, "gen_ai.output.messages"))
+	}
 	for _, key := range []string{
 		"gen_ai.input.messages",
 		"gen_ai.output.messages",
@@ -61,6 +75,38 @@ func validateGenerationSpan(span otel.Span) []Finding {
 		}
 	}
 	return findings
+}
+
+func isErrorGeneration(span otel.Span) bool {
+	if span.Status.Code == "STATUS_CODE_ERROR" {
+		return true
+	}
+	if span.Attributes["langfuse.observation.level"] == "ERROR" {
+		return true
+	}
+	for _, reason := range attrStringSlice(span.Attributes["gen_ai.response.finish_reasons"]) {
+		if reason == "error" {
+			return true
+		}
+	}
+	return false
+}
+
+func attrStringSlice(value any) []string {
+	switch got := value.(type) {
+	case []string:
+		return got
+	case []any:
+		values := make([]string, 0, len(got))
+		for _, item := range got {
+			if text, ok := item.(string); ok {
+				values = append(values, text)
+			}
+		}
+		return values
+	default:
+		return nil
+	}
 }
 
 func validateAgentSpan(span otel.Span) []Finding {
