@@ -91,6 +91,52 @@ func TestValidateReportsMissingRequiredGenerationAttributes(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsErrorGenerationWithoutGenAIOutputMessages(t *testing.T) {
+	findings := ValidateSpans([]otel.Span{{
+		SpanID: "gen_error",
+		Kind:   "SPAN_KIND_CLIENT",
+		Status: otel.Status{Code: "STATUS_CODE_ERROR", Message: "Cannot connect to host chatgpt.com:443 [None]"},
+		Attributes: map[string]any{
+			"langfuse.observation.type":           "generation",
+			"langfuse.session.id":                 "sess_1",
+			"gen_ai.operation.name":               "chat",
+			"gen_ai.provider.name":                "codex",
+			"gen_ai.input.messages":               `[{"role":"user","parts":[{"type":"text","content":"hi"}]}]`,
+			"langfuse.observation.input":          []map[string]any{{"role": "user", "content": "hi"}},
+			"langfuse.observation.output":         map[string]any{"status": "error", "error_type": "connect_error", "message": "Cannot connect to host chatgpt.com:443 [None]"},
+			"langfuse.observation.status_message": "Cannot connect to host chatgpt.com:443 [None]",
+			"error.type":                          "connect_error",
+			"gen_ai.response.finish_reasons":      []string{"error"},
+		},
+	}})
+
+	if len(findings) != 0 {
+		t.Fatalf("expected no findings, got %#v", findings)
+	}
+}
+
+func TestValidateReportsErrorGenerationMissingErrorType(t *testing.T) {
+	findings := ValidateSpans([]otel.Span{{
+		SpanID: "gen_error",
+		Kind:   "SPAN_KIND_CLIENT",
+		Status: otel.Status{Code: "STATUS_CODE_ERROR", Message: "Cannot connect"},
+		Attributes: map[string]any{
+			"langfuse.observation.type":      "generation",
+			"langfuse.session.id":            "sess_1",
+			"gen_ai.operation.name":          "chat",
+			"gen_ai.provider.name":           "codex",
+			"langfuse.observation.input":     []map[string]any{{"role": "user", "content": "hi"}},
+			"langfuse.observation.output":    map[string]any{"status": "error", "message": "Cannot connect"},
+			"gen_ai.response.finish_reasons": []string{"error"},
+		},
+	}})
+
+	joined := findingsText(findings)
+	if !strings.Contains(joined, "missing error.type") {
+		t.Fatalf("expected missing error.type finding, got:\n%s", joined)
+	}
+}
+
 func TestValidateReportsMissingRequiredAgentAttributes(t *testing.T) {
 	findings := ValidateSpans([]otel.Span{{
 		SpanID: "agent1",
