@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
-	"encoding/json"
+	stdjson "encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -18,6 +18,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/zenfun/agelish-teacher/internal/httpraw"
+	"github.com/zenfun/agelish-teacher/internal/jsonx"
 	"github.com/zenfun/agelish-teacher/internal/otel"
 	"github.com/zenfun/agelish-teacher/internal/provider"
 	_ "modernc.org/sqlite"
@@ -299,7 +300,7 @@ func rawEnvelopeSessions(envelopes []httpraw.Envelope) ([]rawEnvelopeSession, er
 			Provider:  providerName,
 			Model:     model,
 			Timestamp: epochMS(timestampMS),
-			Summary:   mustJSON(summary),
+			Summary:   jsonx.String(summary),
 			Outcome:   "ok",
 		}
 		if direction == "response" {
@@ -1123,8 +1124,8 @@ func buildObservationSpansFromPayloads(traceID string, turnSpanID string, sessio
 	}
 	addSystemInstructionAttributes(attrs, parsedRequest)
 	if len(parsedRequest.InputMessages) > 0 {
-		attrs["gen_ai.input.messages"] = mustJSON(parsedRequest.InputMessages)
-		attrs["gen_ai.prompt"] = mustJSON(parsedRequest.InputMessages)
+		attrs["gen_ai.input.messages"] = jsonx.String(parsedRequest.InputMessages)
+		attrs["gen_ai.prompt"] = jsonx.String(parsedRequest.InputMessages)
 		attrs["langfuse.observation.input"] = langfuseDisplayInput(parsedRequest.InputMessages, includeSystemInDisplay)
 	}
 	responseIsError := isGenerationErrorResponse(response, parsedResponse)
@@ -1137,8 +1138,8 @@ func buildObservationSpansFromPayloads(traceID string, turnSpanID string, sessio
 		attrs["langfuse.observation.output"] = errorObservationOutput(response, errorType, parsedResponse)
 	}
 	if !responseIsError && len(parsedResponse.OutputMessages) > 0 {
-		attrs["gen_ai.output.messages"] = mustJSON(parsedResponse.OutputMessages)
-		attrs["gen_ai.completion"] = mustJSON(parsedResponse.OutputMessages)
+		attrs["gen_ai.output.messages"] = jsonx.String(parsedResponse.OutputMessages)
+		attrs["gen_ai.completion"] = jsonx.String(parsedResponse.OutputMessages)
 		attrs["langfuse.observation.output"] = parsedResponse.OutputMessages
 	}
 
@@ -1223,7 +1224,7 @@ func buildObservationSpansFromPayloads(traceID string, turnSpanID string, sessio
 			toolAttrs["gen_ai.tool.namespace"] = call.Namespace
 		}
 		if call.Arguments != nil {
-			toolAttrs["gen_ai.tool.call.arguments"] = mustJSON(call.Arguments)
+			toolAttrs["gen_ai.tool.call.arguments"] = jsonx.String(call.Arguments)
 			toolAttrs["langfuse.observation.input"] = call.Arguments
 		}
 		if result, ok := toolResultsByID[call.ID]; ok {
@@ -1322,7 +1323,7 @@ func roleDisplayName(role string) string {
 
 func parseSummary(raw string) map[string]any {
 	var summary map[string]any
-	if err := json.Unmarshal([]byte(raw), &summary); err != nil {
+	if err := jsonx.Unmarshal([]byte(raw), &summary); err != nil {
 		return map[string]any{}
 	}
 	return summary
@@ -1385,7 +1386,7 @@ func asSummaryInt64(value any) *int64 {
 		return &v
 	case int64:
 		return &got
-	case json.Number:
+	case stdjson.Number:
 		if v, err := got.Int64(); err == nil {
 			return &v
 		}
@@ -1457,7 +1458,7 @@ func addSystemInstructionAttributes(attrs map[string]any, parsed provider.Parsed
 	if len(instructions) == 0 {
 		return
 	}
-	encoded := mustJSON(instructions)
+	encoded := jsonx.String(instructions)
 	attrs["gen_ai.system_instructions"] = encoded
 	attrs["langfuse.observation.metadata.systemPrompt"] = encoded
 }
@@ -1896,12 +1897,4 @@ func langfuseLevel(outcome string) string {
 	default:
 		return "DEFAULT"
 	}
-}
-
-func mustJSON(value any) string {
-	raw, err := json.Marshal(value)
-	if err != nil {
-		return fmt.Sprint(value)
-	}
-	return string(raw)
 }

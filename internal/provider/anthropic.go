@@ -1,6 +1,6 @@
 package provider
 
-import "encoding/json"
+import "github.com/zenfun/agelish-teacher/internal/jsonx"
 
 func parseAnthropicRequest(body []byte) (ParsedPayload, error) {
 	data, ok := loadObject(body)
@@ -89,7 +89,7 @@ func parseAnthropicSSE(body []byte) ParsedPayload {
 		case "tool_use":
 			var args any = map[string]any{}
 			if inputBuf != "" {
-				if err := json.Unmarshal([]byte(inputBuf), &args); err != nil {
+				if err := jsonx.Unmarshal([]byte(inputBuf), &args); err != nil {
 					args = map[string]any{"_raw": inputBuf}
 				}
 			}
@@ -202,7 +202,7 @@ func anthropicParts(raw any) ([]Part, []ToolCall, []ToolResult) {
 					parts = append(parts, toolResultPart(id, content))
 					results = append(results, ToolResult{ID: id, Output: content})
 				case "image":
-					parts = append(parts, imagePart(compactJSON(block)))
+					parts = append(parts, imagePart(jsonx.String(block)))
 				default:
 					if text, ok := block["text"].(string); ok && text != "" {
 						parts = append(parts, textPart(text))

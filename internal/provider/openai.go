@@ -1,9 +1,10 @@
 package provider
 
 import (
-	"encoding/json"
 	"sort"
 	"strings"
+
+	"github.com/zenfun/agelish-teacher/internal/jsonx"
 )
 
 var openAIToolCallTypes = map[string]bool{
@@ -245,7 +246,7 @@ func (stream *openAIChatCompletionStream) addToolCallDeltas(raw any) {
 				continue
 			default:
 				if accum.Arguments == "" {
-					accum.Arguments = compactJSON(args)
+					accum.Arguments = jsonx.String(args)
 				}
 			}
 		}
@@ -319,7 +320,7 @@ func openAIToolArguments(raw any) any {
 		return map[string]any{}
 	}
 	var decoded any
-	if err := json.Unmarshal([]byte(trimmed), &decoded); err == nil && decoded != nil {
+	if err := jsonx.Unmarshal([]byte(trimmed), &decoded); err == nil && decoded != nil {
 		return decoded
 	}
 	return firstString(raw)
@@ -509,7 +510,7 @@ func openAIContentParts(raw any) []Part {
 						parts = append(parts, reasoningPart(text))
 					}
 				case "input_image":
-					parts = append(parts, imagePart(compactJSON(part)))
+					parts = append(parts, imagePart(jsonx.String(part)))
 				case "encrypted_content":
 					if encrypted, ok := part["encrypted_content"].(string); ok && encrypted != "" {
 						parts = append(parts, Part{Type: "encrypted_content", Content: map[string]any{"chars": len(encrypted)}})
@@ -601,7 +602,7 @@ func firstString(values ...any) string {
 		case nil:
 			continue
 		default:
-			text := compactJSON(got)
+			text := jsonx.String(got)
 			if text != "" && text != "null" {
 				return text
 			}
