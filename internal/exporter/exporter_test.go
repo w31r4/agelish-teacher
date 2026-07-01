@@ -203,6 +203,49 @@ func TestExporterAddsCodexGoalContextAttributes(t *testing.T) {
 	assertAttr(t, generation.Attributes, "scribe.codex.internal_context.sources", []string{"goal"})
 }
 
+func TestExporterAddsDiagnosticOutputAndErrorTypeForFailedGeneration(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "traces.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	createScribeSchema(t, db)
+
+	insertSession(t, db, "sess_error", "codex", 1710000000000, 1710000004000)
+	insertTurn(t, db, "turn_error", "sess_error", 1, "completed", 1710000000100, 1710000003000)
+	insertTraceRequest(t, db, traceRow{
+		ID: "req_error", SessionID: "sess_error", TurnID: "turn_error", RequestID: "call_error",
+		Direction: "request", Provider: "codex", Model: "gpt-5.5", Timestamp: 1710000000200,
+	})
+	insertTraceRequest(t, db, traceRow{
+		ID: "resp_error", SessionID: "sess_error", TurnID: "turn_error", RequestID: "call_error",
+		Direction: "response", Provider: "codex", Model: "gpt-5.5", Timestamp: 1710000001200,
+		Outcome: "error", StopReason: "error", ErrorMessage: "Cannot connect to host chatgpt.com:443 [None]",
+	})
+	insertRawPayload(t, db, "raw_req_error", "req_error", "identity", []byte(`{"model":"gpt-5.5","input":"Run audit."}`))
+
+	result, err := Export(context.Background(), Options{DBPath: dbPath})
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+
+	generation := findSpanByAttr(t, result.Spans, "langfuse.observation.type", "generation")
+	if generation.Status.Code != "STATUS_CODE_ERROR" {
+		t.Fatalf("expected error status, got %#v", generation.Status)
+	}
+	assertAttr(t, generation.Attributes, "error.type", "connect_error")
+	assertAttr(t, generation.Attributes, "langfuse.observation.status_message", "Cannot connect to host chatgpt.com:443 [None]")
+	assertAttrJSONContains(t, generation.Attributes, "langfuse.observation.output", `"status":"error"`)
+	assertAttrJSONContains(t, generation.Attributes, "langfuse.observation.output", `"error_type":"connect_error"`)
+	if _, ok := generation.Attributes["gen_ai.output.messages"]; ok {
+		t.Fatalf("error generation must not invent gen_ai.output.messages: %#v", generation.Attributes["gen_ai.output.messages"])
+	}
+	if _, ok := generation.Attributes["gen_ai.completion"]; ok {
+		t.Fatalf("error generation must not invent gen_ai.completion: %#v", generation.Attributes["gen_ai.completion"])
+	}
+}
+
 func TestExporterConvertsRawHTTPBodiesWithoutScribeDB(t *testing.T) {
 	requestBody := []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">\n<objective>\nExpose raw body conversion.\n</objective>\n</codex_internal_context>\nRun pwd."}]}]}`)
 	responseBody := []byte(`{"model":"gpt-5-codex","status":"requires_action","output":[{"type":"function_call","call_id":"call_exec_raw","name":"exec_command","arguments":{"cmd":"pwd"}}],"usage":{"input_tokens":10,"output_tokens":5}}`)
@@ -653,6 +696,8 @@ type traceRow struct {
 	Timestamp           int64
 	Summary             string
 	Outcome             string
+	ErrorType           string
+	ErrorMessage        string
 	HTTPStatus          int64
 	StopReason          string
 	InputTokens         *int64
@@ -711,15 +756,16 @@ func insertTraceRequest(t *testing.T, db *sql.DB, row traceRow) {
 		row.Summary = "{}"
 	}
 	if _, err := db.Exec(`INSERT INTO trace_requests (
-		id, session_id, turn_id, parent_request_id, request_id, direction, provider, model,
-		requested_model, timestamp, summary, outcome, http_status, stop_reason, input_tokens,
-		output_tokens, tool_call_count, cache_read_tokens, cache_creation_tokens, reasoning_tokens,
-		max_tokens, duration_ms
-	) VALUES (?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, NULLIF(?, 0), NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?)`,
+			id, session_id, turn_id, parent_request_id, request_id, direction, provider, model,
+			requested_model, timestamp, summary, outcome, http_status, stop_reason, input_tokens,
+			output_tokens, tool_call_count, cache_read_tokens, cache_creation_tokens, reasoning_tokens,
+			max_tokens, duration_ms
+			, error_type, error_message
+		) VALUES (?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, NULLIF(?, 0), NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''))`,
 		row.ID, row.SessionID, row.TurnID, row.ParentRequestID, row.RequestID, row.Direction,
 		row.Provider, row.Model, row.RequestedModel, row.Timestamp, row.Summary, row.Outcome, row.HTTPStatus,
 		row.StopReason, row.InputTokens, row.OutputTokens, row.ToolCallCount, row.CacheReadTokens,
-		row.CacheCreationTokens, row.ReasoningTokens, row.MaxTokens, row.DurationMS,
+		row.CacheCreationTokens, row.ReasoningTokens, row.MaxTokens, row.DurationMS, row.ErrorType, row.ErrorMessage,
 	); err != nil {
 		t.Fatalf("insert trace request %s: %v", row.ID, err)
 	}
