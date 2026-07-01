@@ -203,6 +203,133 @@ func TestExporterAddsCodexGoalContextAttributes(t *testing.T) {
 	assertAttr(t, generation.Attributes, "scribe.codex.internal_context.sources", []string{"goal"})
 }
 
+func TestExporterKeepsSystemPromptOnlyOnFirstGenerationDisplayInput(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "traces.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	createScribeSchema(t, db)
+
+	insertSession(t, db, "sess_system_display", "codex", 1710000000000, 1710000005000)
+	insertTurn(t, db, "turn_system_display", "sess_system_display", 1, "completed", 1710000000100, 1710000004000)
+	insertTraceRequest(t, db, traceRow{
+		ID: "req_first", SessionID: "sess_system_display", TurnID: "turn_system_display", RequestID: "call_first",
+		Direction: "request", Provider: "codex", Model: "gpt-5-codex", Timestamp: 1710000000200,
+	})
+	insertTraceRequest(t, db, traceRow{
+		ID: "resp_first", SessionID: "sess_system_display", TurnID: "turn_system_display", RequestID: "call_first",
+		Direction: "response", Provider: "codex", Model: "gpt-5-codex", Timestamp: 1710000001200,
+		Outcome: "ok", HTTPStatus: 200, StopReason: "completed",
+	})
+	subagentSummary := `{
+		"request_role": "subagent",
+		"fine_role": "codex_subagent",
+		"request_role_classifier": "subagent",
+		"request_role_classifier_confidence": "high"
+	}`
+	insertTraceRequest(t, db, traceRow{
+		ID: "req_second", SessionID: "sess_system_display", TurnID: "turn_system_display", RequestID: "call_second",
+		Direction: "request", Provider: "codex", Model: "gpt-5-codex", Timestamp: 1710000002200,
+		Summary: subagentSummary,
+	})
+	insertTraceRequest(t, db, traceRow{
+		ID: "resp_second", SessionID: "sess_system_display", TurnID: "turn_system_display", RequestID: "call_second",
+		Direction: "response", Provider: "codex", Model: "gpt-5-codex", Timestamp: 1710000003200,
+		Outcome: "ok", HTTPStatus: 200, StopReason: "completed", Summary: subagentSummary,
+	})
+	insertRawPayload(t, db, "raw_req_first", "req_first", "identity", []byte(`{"model":"gpt-5-codex","instructions":"First system prompt.","input":"First user."}`))
+	insertRawPayload(t, db, "raw_resp_first", "resp_first", "identity", []byte(`{"model":"gpt-5-codex","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"First output."}]}]}`))
+	insertRawPayload(t, db, "raw_req_second", "req_second", "identity", []byte(`{"model":"gpt-5-codex","instructions":"Second system prompt.","input":"Second user."}`))
+	insertRawPayload(t, db, "raw_resp_second", "resp_second", "identity", []byte(`{"model":"gpt-5-codex","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Second output."}]}]}`))
+
+	result, err := Export(context.Background(), Options{DBPath: dbPath})
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+
+	firstGeneration := findSpanByAttrs(t, result.Spans, map[string]any{
+		"langfuse.observation.type": "generation",
+		"scribe.trace_request.id":   "resp_first",
+	})
+	assertAttrJSONContains(t, firstGeneration.Attributes, "langfuse.observation.input", "First system prompt.")
+	assertAttrJSONContains(t, firstGeneration.Attributes, "gen_ai.system_instructions", "First system prompt.")
+
+	secondGeneration := findSpanByAttrs(t, result.Spans, map[string]any{
+		"langfuse.observation.type": "generation",
+		"scribe.trace_request.id":   "resp_second",
+	})
+	assertAttrJSONNotContains(t, secondGeneration.Attributes, "langfuse.observation.input", "Second system prompt.")
+	assertAttrJSONContains(t, secondGeneration.Attributes, "langfuse.observation.input", "Second user.")
+	assertAttrJSONContains(t, secondGeneration.Attributes, "gen_ai.system_instructions", "Second system prompt.")
+	assertAttrJSONContains(t, secondGeneration.Attributes, "gen_ai.input.messages", "Second system prompt.")
+
+	agent := findSpanByAttrs(t, result.Spans, map[string]any{
+		"langfuse.observation.type": "agent",
+		"scribe.trace_request.id":   "resp_second",
+	})
+	assertAttrJSONNotContains(t, agent.Attributes, "langfuse.observation.input", "Second system prompt.")
+	assertAttrJSONContains(t, agent.Attributes, "langfuse.observation.input", "Second user.")
+}
+
+func TestExporterEmitsDiagnosticDisplayInputWhenSystemFilteringRemovesEverything(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "traces.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	createScribeSchema(t, db)
+
+	insertSession(t, db, "sess_system_only", "codex", 1710000000000, 1710000005000)
+	insertTurn(t, db, "turn_system_only", "sess_system_only", 1, "completed", 1710000000100, 1710000004000)
+	insertTraceRequest(t, db, traceRow{
+		ID: "req_first_system_only", SessionID: "sess_system_only", TurnID: "turn_system_only", RequestID: "call_first_system_only",
+		Direction: "request", Provider: "codex", Model: "gpt-5-codex", Timestamp: 1710000000200,
+	})
+	insertTraceRequest(t, db, traceRow{
+		ID: "resp_first_system_only", SessionID: "sess_system_only", TurnID: "turn_system_only", RequestID: "call_first_system_only",
+		Direction: "response", Provider: "codex", Model: "gpt-5-codex", Timestamp: 1710000001200,
+		Outcome: "ok", HTTPStatus: 200, StopReason: "completed",
+	})
+	insertTraceRequest(t, db, traceRow{
+		ID: "req_later_system_only", SessionID: "sess_system_only", TurnID: "turn_system_only", RequestID: "call_later_system_only",
+		Direction: "request", Provider: "codex", Model: "gpt-5-codex", Timestamp: 1710000002200,
+	})
+	insertTraceRequest(t, db, traceRow{
+		ID: "resp_later_system_only", SessionID: "sess_system_only", TurnID: "turn_system_only", RequestID: "call_later_system_only",
+		Direction: "response", Provider: "codex", Model: "gpt-5-codex", Timestamp: 1710000003200,
+		Outcome: "ok", HTTPStatus: 200, StopReason: "completed",
+	})
+	insertRawPayload(t, db, "raw_req_first_system_only", "req_first_system_only", "identity", []byte(`{"model":"gpt-5-codex","instructions":"First system prompt.","input":"First user."}`))
+	insertRawPayload(t, db, "raw_resp_first_system_only", "resp_first_system_only", "identity", []byte(`{"model":"gpt-5-codex","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"First output."}]}]}`))
+	insertRawPayload(t, db, "raw_req_later_system_only", "req_later_system_only", "identity", []byte(`{"model":"gpt-5-codex","instructions":"Only system prompt."}`))
+	insertRawPayload(t, db, "raw_resp_later_system_only", "resp_later_system_only", "identity", []byte(`{"model":"gpt-5-codex","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Later output."}]}]}`))
+
+	result, err := Export(context.Background(), Options{DBPath: dbPath})
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+
+	laterGeneration := findSpanByAttrs(t, result.Spans, map[string]any{
+		"langfuse.observation.type": "generation",
+		"scribe.trace_request.id":   "resp_later_system_only",
+	})
+	displayInput, ok := laterGeneration.Attributes["langfuse.observation.input"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected diagnostic display input map, got %#v", laterGeneration.Attributes["langfuse.observation.input"])
+	}
+	if displayInput["status"] != "input_filtered" {
+		t.Fatalf("diagnostic status mismatch: %#v", displayInput)
+	}
+	if displayInput["system_prompt_in_metadata"] != true {
+		t.Fatalf("diagnostic should point to metadata system prompt: %#v", displayInput)
+	}
+	assertAttrJSONContains(t, laterGeneration.Attributes, "gen_ai.system_instructions", "Only system prompt.")
+	assertAttrJSONContains(t, laterGeneration.Attributes, "gen_ai.input.messages", "Only system prompt.")
+}
+
 func TestExporterAddsDiagnosticOutputAndErrorTypeForFailedGeneration(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "traces.db")
 	db, err := sql.Open("sqlite", dbPath)
@@ -742,6 +869,21 @@ func assertAttrJSONContains(t *testing.T, attrs map[string]any, key string, want
 	}
 	if !strings.Contains(string(gotJSON), want) {
 		t.Fatalf("attr %s should contain %q, got %s", key, want, gotJSON)
+	}
+}
+
+func assertAttrJSONNotContains(t *testing.T, attrs map[string]any, key string, unwanted string) {
+	t.Helper()
+	got, ok := attrs[key]
+	if !ok {
+		t.Fatalf("missing attr %s in %#v", key, attrs)
+	}
+	gotJSON, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("attr %s is not JSON-marshalable: %v", key, err)
+	}
+	if strings.Contains(string(gotJSON), unwanted) {
+		t.Fatalf("attr %s should not contain %q, got %s", key, unwanted, gotJSON)
 	}
 }
 

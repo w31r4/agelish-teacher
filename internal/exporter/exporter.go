@@ -429,6 +429,7 @@ func exportSession(ctx context.Context, db *sql.DB, session sessionRow) ([]otel.
 
 	var sessionInput any
 	var sessionOutput any
+	generationIndex := 0
 	for _, turn := range turns {
 		turnSpanID := otel.DeriveSpanID("turn:" + turn.ID)
 		turnEnd := turn.StartedAt.Int64()
@@ -487,7 +488,7 @@ func exportSession(ctx context.Context, db *sql.DB, session sessionRow) ([]otel.
 				continue
 			}
 			paired := requestByRequestID[tr.RequestID]
-			observationSpans, err := buildObservationSpans(ctx, db, traceID, turnSpanID, session.ID, rootName, tr, paired, turnPayloads.ToolResultsByID)
+			observationSpans, err := buildObservationSpans(ctx, db, traceID, turnSpanID, session.ID, rootName, tr, paired, turnPayloads.ToolResultsByID, &generationIndex)
 			if err != nil {
 				return nil, err
 			}
@@ -708,7 +709,7 @@ func traceColumn(columns map[string]bool, name string, fallback string) string {
 	return fallback + " AS " + name
 }
 
-func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turnSpanID string, sessionID string, traceName string, response traceRequestRow, request traceRequestRow, toolResultsByID map[string]provider.ToolResult) ([]otel.Span, error) {
+func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turnSpanID string, sessionID string, traceName string, response traceRequestRow, request traceRequestRow, toolResultsByID map[string]provider.ToolResult, generationIndex *int) ([]otel.Span, error) {
 	responseBody, err := rawPayload(ctx, db, response.ID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
@@ -771,6 +772,11 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 			Status:        status,
 		}}, nil
 	}
+	includeSystemInDisplay := true
+	if generationIndex != nil {
+		includeSystemInDisplay = *generationIndex == 0
+		*generationIndex = *generationIndex + 1
+	}
 	attrs := map[string]any{
 		"gen_ai.provider.name":       response.Provider,
 		"gen_ai.operation.name":      "chat",
@@ -818,7 +824,7 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 	if len(parsedRequest.InputMessages) > 0 {
 		attrs["gen_ai.input.messages"] = mustJSON(parsedRequest.InputMessages)
 		attrs["gen_ai.prompt"] = mustJSON(parsedRequest.InputMessages)
-		attrs["langfuse.observation.input"] = parsedRequest.InputMessages
+		attrs["langfuse.observation.input"] = langfuseDisplayInput(parsedRequest.InputMessages, includeSystemInDisplay)
 	}
 	responseIsError := isGenerationErrorResponse(response, parsedResponse)
 	if responseIsError {
@@ -859,7 +865,7 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 		addScribeSummaryAttributes(agentAttrs, summaries)
 		addInternalContextAttributes(agentAttrs, parsedRequest.InternalContexts)
 		if len(parsedRequest.InputMessages) > 0 {
-			agentAttrs["langfuse.observation.input"] = parsedRequest.InputMessages
+			agentAttrs["langfuse.observation.input"] = langfuseDisplayInput(parsedRequest.InputMessages, includeSystemInDisplay)
 		}
 		if len(parsedResponse.OutputMessages) > 0 {
 			agentAttrs["langfuse.observation.output"] = parsedResponse.OutputMessages
@@ -1122,6 +1128,32 @@ func addInternalContextAttributes(attrs map[string]any, contexts []provider.Inte
 	if len(sources) > 0 {
 		attrs["scribe.codex.internal_context.sources"] = sources
 	}
+}
+
+func langfuseDisplayInput(messages []provider.Message, includeSystem bool) any {
+	if includeSystem {
+		return messages
+	}
+	displayMessages := make([]provider.Message, 0, len(messages))
+	filteredSystem := false
+	for _, message := range messages {
+		if strings.EqualFold(strings.TrimSpace(message.Role), "system") {
+			filteredSystem = true
+			continue
+		}
+		displayMessages = append(displayMessages, message)
+	}
+	if len(displayMessages) > 0 {
+		return displayMessages
+	}
+	if filteredSystem {
+		return map[string]any{
+			"status":                    "input_filtered",
+			"reason":                    "system prompt hidden from repeated Langfuse display input",
+			"system_prompt_in_metadata": true,
+		}
+	}
+	return messages
 }
 
 func shouldCreateControlSpan(summaries []map[string]any) bool {
