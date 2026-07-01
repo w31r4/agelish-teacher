@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/zenfun/agelish-teacher/internal/exporter"
+	"github.com/zenfun/agelish-teacher/internal/httpraw"
 	"github.com/zenfun/agelish-teacher/internal/langfuse"
 	"github.com/zenfun/agelish-teacher/internal/otlp"
 	"github.com/zenfun/agelish-teacher/internal/semconv"
@@ -30,6 +31,8 @@ func main() {
 	var rawResponsePath string
 	var rawSessionID string
 	var rawRequestID string
+	var rawEnvelopePath string
+	var rawEnvelopeStdin bool
 
 	flag.StringVar(&dbPath, "db", "", "Scribe SQLite DB path; defaults to ~/.scribe/traces.db")
 	flag.StringVar(&sessionID, "session", "", "export only one Scribe session id")
@@ -47,19 +50,23 @@ func main() {
 	flag.StringVar(&rawResponsePath, "raw-response", "", "path to a raw HTTP response body JSON/SSE file")
 	flag.StringVar(&rawSessionID, "raw-session-id", "", "session id for raw HTTP body conversion")
 	flag.StringVar(&rawRequestID, "raw-request-id", "", "request id for raw HTTP body conversion")
+	flag.StringVar(&rawEnvelopePath, "raw-envelope", "", "path to canonical raw HTTP envelope JSONL")
+	flag.BoolVar(&rawEnvelopeStdin, "raw-envelope-stdin", false, "read canonical raw HTTP envelope JSONL from stdin")
 	flag.Parse()
 
 	ctx := context.Background()
 	result, err := exportResult(ctx, exportConfig{
-		DBPath:          dbPath,
-		SessionID:       sessionID,
-		IncludeActive:   includeActive,
-		RawProvider:     rawProvider,
-		RawSource:       rawSource,
-		RawRequestPath:  rawRequestPath,
-		RawResponsePath: rawResponsePath,
-		RawSessionID:    rawSessionID,
-		RawRequestID:    rawRequestID,
+		DBPath:           dbPath,
+		SessionID:        sessionID,
+		IncludeActive:    includeActive,
+		RawProvider:      rawProvider,
+		RawSource:        rawSource,
+		RawRequestPath:   rawRequestPath,
+		RawResponsePath:  rawResponsePath,
+		RawSessionID:     rawSessionID,
+		RawRequestID:     rawRequestID,
+		RawEnvelopePath:  rawEnvelopePath,
+		RawEnvelopeStdin: rawEnvelopeStdin,
 	})
 	if err != nil {
 		fatal(err)
@@ -120,18 +127,27 @@ func fatal(err error) {
 }
 
 type exportConfig struct {
-	DBPath          string
-	SessionID       string
-	IncludeActive   bool
-	RawProvider     string
-	RawSource       string
-	RawRequestPath  string
-	RawResponsePath string
-	RawSessionID    string
-	RawRequestID    string
+	DBPath           string
+	SessionID        string
+	IncludeActive    bool
+	RawProvider      string
+	RawSource        string
+	RawRequestPath   string
+	RawResponsePath  string
+	RawSessionID     string
+	RawRequestID     string
+	RawEnvelopePath  string
+	RawEnvelopeStdin bool
 }
 
 func exportResult(ctx context.Context, cfg exportConfig) (exporter.Result, error) {
+	if cfg.RawEnvelopePath != "" || cfg.RawEnvelopeStdin {
+		envelopes, err := readRawEnvelopes(cfg.RawEnvelopePath, cfg.RawEnvelopeStdin)
+		if err != nil {
+			return exporter.Result{}, err
+		}
+		return exporter.ExportRawEnvelopes(exporter.RawEnvelopeOptions{Envelopes: envelopes})
+	}
 	if cfg.RawProvider != "" || cfg.RawRequestPath != "" || cfg.RawResponsePath != "" {
 		requestBody, err := readOptionalFile(cfg.RawRequestPath)
 		if err != nil {
@@ -155,6 +171,21 @@ func exportResult(ctx context.Context, cfg exportConfig) (exporter.Result, error
 		SessionID:     cfg.SessionID,
 		IncludeActive: cfg.IncludeActive,
 	})
+}
+
+func readRawEnvelopes(path string, stdin bool) ([]httpraw.Envelope, error) {
+	if path != "" && stdin {
+		return nil, fmt.Errorf("-raw-envelope and -raw-envelope-stdin are mutually exclusive")
+	}
+	if stdin {
+		return httpraw.DecodeJSONL(os.Stdin)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open raw envelope: %w", err)
+	}
+	defer file.Close()
+	return httpraw.DecodeJSONL(file)
 }
 
 func readOptionalFile(path string) ([]byte, error) {
