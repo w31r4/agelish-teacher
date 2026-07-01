@@ -28,6 +28,9 @@ func parseOpenAIRequest(body []byte) (ParsedPayload, error) {
 		parsed.SystemInstructions = append(parsed.SystemInstructions, instructions)
 		parsed.InputMessages = append(parsed.InputMessages, Message{Role: "system", Parts: []Part{textPart(instructions)}})
 	}
+	if model, ok := data["model"].(string); ok {
+		parsed.Model = model
+	}
 	parsed.MaxTokens = firstInt(data["max_output_tokens"], data["max_completion_tokens"], data["max_tokens"])
 
 	if messages, ok := data["messages"].([]any); ok {
