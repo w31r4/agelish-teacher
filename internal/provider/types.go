@@ -1,11 +1,12 @@
 package provider
 
 import (
-	"encoding/json"
-	"fmt"
+	stdjson "encoding/json"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/zenfun/agelish-teacher/internal/jsonx"
 )
 
 type ParsedPayload struct {
@@ -115,7 +116,7 @@ func normalizeProvider(provider string) string {
 
 func loadObject(body []byte) (map[string]any, bool) {
 	var data map[string]any
-	if err := json.Unmarshal(body, &data); err != nil {
+	if err := jsonx.Unmarshal(body, &data); err != nil {
 		return nil, false
 	}
 	return data, true
@@ -142,7 +143,7 @@ func asInt64(raw any) *int64 {
 	case int64:
 		i := v
 		return &i
-	case json.Number:
+	case stdjson.Number:
 		if i, err := v.Int64(); err == nil {
 			return &i
 		}
@@ -199,14 +200,6 @@ func firstInt(values ...any) *int64 {
 		}
 	}
 	return nil
-}
-
-func compactJSON(value any) string {
-	raw, err := json.Marshal(value)
-	if err != nil {
-		return fmt.Sprint(value)
-	}
-	return string(raw)
 }
 
 func textPart(text string) Part {

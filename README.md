@@ -150,6 +150,20 @@ go run ./cmd/agelish-teacher \
 The client posts to `/api/public/otel/v1/traces` with Basic auth and
 `x-langfuse-ingestion-version: 4`.
 
+## JSON Implementation
+
+Production code uses the internal `jsonx` package instead of direct
+`encoding/json` calls. Normal builds use Go's stable `encoding/json`. Go 1.25's
+experimental official JSON v2 implementation can be tested with:
+
+```bash
+GOEXPERIMENT=jsonv2 go test ./...
+GOEXPERIMENT=jsonv2 go test -bench=. ./internal/jsonx ./internal/ingest
+```
+
+This keeps the default binary conservative while making performance comparisons
+repeatable on the same parser/exporter workload.
+
 ## Notes
 
 OpenTelemetry GenAI semantic conventions are still development-stage and have

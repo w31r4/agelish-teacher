@@ -1,9 +1,9 @@
 package semconv
 
 import (
-	"encoding/json"
 	"fmt"
 
+	"github.com/zenfun/agelish-teacher/internal/jsonx"
 	"github.com/zenfun/agelish-teacher/internal/otel"
 )
 
@@ -181,5 +181,5 @@ func validJSONString(value any) bool {
 		return false
 	}
 	var decoded any
-	return json.Unmarshal([]byte(text), &decoded) == nil
+	return jsonx.Unmarshal([]byte(text), &decoded) == nil
 }

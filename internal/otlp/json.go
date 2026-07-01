@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strconv"
 
+	"github.com/zenfun/agelish-teacher/internal/jsonx"
 	"github.com/zenfun/agelish-teacher/internal/otel"
 )
 
@@ -143,6 +144,6 @@ func anyValue(value any) AnyValue {
 		}
 		return AnyValue{ArrayValue: &ArrayValue{Values: values}}
 	default:
-		return AnyValue{StringValue: stringsTrimJSON(value)}
+		return AnyValue{StringValue: jsonx.String(value)}
 	}
 }

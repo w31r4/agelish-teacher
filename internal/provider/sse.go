@@ -1,8 +1,9 @@
 package provider
 
 import (
-	"encoding/json"
 	"strings"
+
+	"github.com/zenfun/agelish-teacher/internal/jsonx"
 )
 
 type sseEvent struct {
@@ -25,7 +26,7 @@ func parseSSE(raw []byte) []sseEvent {
 		var data any
 		if joined == "[DONE]" {
 			data = joined
-		} else if err := json.Unmarshal([]byte(joined), &data); err != nil {
+		} else if err := jsonx.Unmarshal([]byte(joined), &data); err != nil {
 			data = joined
 		}
 		eventName := currentEvent

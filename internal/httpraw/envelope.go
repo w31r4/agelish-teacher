@@ -3,10 +3,11 @@ package httpraw
 import (
 	"bufio"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
+
+	"github.com/zenfun/agelish-teacher/internal/jsonx"
 )
 
 type Envelope struct {
@@ -73,7 +74,7 @@ func DecodeJSONL(r io.Reader) ([]Envelope, error) {
 		if strings.TrimSpace(line) != "" {
 			lineNumber++
 			var envelope Envelope
-			if jsonErr := json.Unmarshal([]byte(line), &envelope); jsonErr != nil {
+			if jsonErr := jsonx.Unmarshal([]byte(line), &envelope); jsonErr != nil {
 				return nil, fmt.Errorf("decode envelope line %d: %w", lineNumber, jsonErr)
 			}
 			envelopes = append(envelopes, envelope)
