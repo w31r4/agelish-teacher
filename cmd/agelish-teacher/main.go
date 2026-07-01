@@ -2,22 +2,23 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
+	"time"
 
 	"github.com/zenfun/agelish-teacher/internal/exporter"
 	"github.com/zenfun/agelish-teacher/internal/httpraw"
+	"github.com/zenfun/agelish-teacher/internal/ingest"
+	"github.com/zenfun/agelish-teacher/internal/jsonx"
 	"github.com/zenfun/agelish-teacher/internal/langfuse"
 	"github.com/zenfun/agelish-teacher/internal/otlp"
 	"github.com/zenfun/agelish-teacher/internal/semconv"
 )
 
 func main() {
-	var dbPath string
-	var sessionID string
-	var includeActive bool
+	var exportCfg exportConfig
 	var outPath string
 	var format string
 	var send bool
@@ -25,18 +26,15 @@ func main() {
 	var langfuseURL string
 	var publicKey string
 	var secretKey string
-	var rawProvider string
-	var rawSource string
-	var rawRequestPath string
-	var rawResponsePath string
-	var rawSessionID string
-	var rawRequestID string
-	var rawEnvelopePath string
-	var rawEnvelopeStdin bool
+	var serve bool
+	var listen string
+	var workers int
+	var maxPairBytes int64
+	var requestTimeout time.Duration
 
-	flag.StringVar(&dbPath, "db", "", "Scribe SQLite DB path; defaults to ~/.scribe/traces.db")
-	flag.StringVar(&sessionID, "session", "", "export only one Scribe session id")
-	flag.BoolVar(&includeActive, "include-active", false, "include sessions without ended_at")
+	flag.StringVar(&exportCfg.DBPath, "db", "", "Scribe SQLite DB path; defaults to ~/.scribe/traces.db")
+	flag.StringVar(&exportCfg.SessionID, "session", "", "export only one Scribe session id")
+	flag.BoolVar(&exportCfg.IncludeActive, "include-active", false, "include sessions without ended_at")
 	flag.StringVar(&outPath, "out", "", "write output JSON to this path instead of stdout")
 	flag.StringVar(&format, "format", "otlp-json", "output format: otlp-json or spans")
 	flag.BoolVar(&send, "send", false, "POST OTLP JSON to Langfuse")
@@ -44,37 +42,48 @@ func main() {
 	flag.StringVar(&langfuseURL, "langfuse-url", os.Getenv("LANGFUSE_BASE_URL"), "Langfuse base URL")
 	flag.StringVar(&publicKey, "langfuse-public-key", os.Getenv("LANGFUSE_PUBLIC_KEY"), "Langfuse public key")
 	flag.StringVar(&secretKey, "langfuse-secret-key", os.Getenv("LANGFUSE_SECRET_KEY"), "Langfuse secret key")
-	flag.StringVar(&rawProvider, "raw-provider", "", "provider for raw HTTP body conversion, e.g. codex, anthropic, openai")
-	flag.StringVar(&rawSource, "raw-source", "", "source label for raw HTTP body conversion; defaults to raw-provider")
-	flag.StringVar(&rawRequestPath, "raw-request", "", "path to a raw HTTP request body JSON/SSE file")
-	flag.StringVar(&rawResponsePath, "raw-response", "", "path to a raw HTTP response body JSON/SSE file")
-	flag.StringVar(&rawSessionID, "raw-session-id", "", "session id for raw HTTP body conversion")
-	flag.StringVar(&rawRequestID, "raw-request-id", "", "request id for raw HTTP body conversion")
-	flag.StringVar(&rawEnvelopePath, "raw-envelope", "", "path to canonical raw HTTP envelope JSONL")
-	flag.BoolVar(&rawEnvelopeStdin, "raw-envelope-stdin", false, "read canonical raw HTTP envelope JSONL from stdin")
+	flag.StringVar(&exportCfg.RawProvider, "raw-provider", "", "provider for raw HTTP body conversion, e.g. codex, anthropic, openai")
+	flag.StringVar(&exportCfg.RawSource, "raw-source", "", "source label for raw HTTP body conversion; defaults to raw-provider")
+	flag.StringVar(&exportCfg.RawRequestPath, "raw-request", "", "path to a raw HTTP request body JSON/SSE file")
+	flag.StringVar(&exportCfg.RawResponsePath, "raw-response", "", "path to a raw HTTP response body JSON/SSE file")
+	flag.StringVar(&exportCfg.RawSessionID, "raw-session-id", "", "session id for raw HTTP body conversion")
+	flag.StringVar(&exportCfg.RawRequestID, "raw-request-id", "", "request id for raw HTTP body conversion")
+	flag.StringVar(&exportCfg.RawEnvelopePath, "raw-envelope", "", "path to canonical raw HTTP envelope JSONL")
+	flag.BoolVar(&exportCfg.RawEnvelopeStdin, "raw-envelope-stdin", false, "read canonical raw HTTP envelope JSONL from stdin")
+	flag.BoolVar(&serve, "serve", false, "run local HTTP raw pair ingest server")
+	flag.StringVar(&listen, "listen", "127.0.0.1:4319", "address for -serve to listen on")
+	flag.IntVar(&workers, "workers", 0, "maximum concurrent pair ingests for -serve; defaults to runtime.NumCPU")
+	flag.Int64Var(&maxPairBytes, "max-pair-bytes", 64<<20, "maximum JSON request size for -serve /v1/pairs")
+	flag.DurationVar(&requestTimeout, "request-timeout", 30*time.Second, "per-request timeout for -serve")
 	flag.Parse()
 
 	ctx := context.Background()
-	result, err := exportResult(ctx, exportConfig{
-		DBPath:           dbPath,
-		SessionID:        sessionID,
-		IncludeActive:    includeActive,
-		RawProvider:      rawProvider,
-		RawSource:        rawSource,
-		RawRequestPath:   rawRequestPath,
-		RawResponsePath:  rawResponsePath,
-		RawSessionID:     rawSessionID,
-		RawRequestID:     rawRequestID,
-		RawEnvelopePath:  rawEnvelopePath,
-		RawEnvelopeStdin: rawEnvelopeStdin,
-	})
+	if serve {
+		client := langfuse.Client{
+			BaseURL:   langfuseURL,
+			PublicKey: publicKey,
+			SecretKey: secretKey,
+		}
+		ingestCfg := ingest.Config{
+			Langfuse:       client,
+			Workers:        workers,
+			MaxPairBytes:   maxPairBytes,
+			RequestTimeout: requestTimeout,
+		}
+		if err := serveIngest(listen, ingestCfg); err != nil {
+			fatal(err)
+		}
+		return
+	}
+
+	result, err := exportResult(ctx, exportCfg)
 	if err != nil {
 		fatal(err)
 	}
 	if checkStandard {
 		findings := semconv.ValidateSpans(result.Spans)
 		if len(findings) > 0 {
-			rawFindings, _ := json.MarshalIndent(findings, "", "  ")
+			rawFindings, _ := jsonx.MarshalIndent(findings, "", "  ")
 			_, _ = os.Stderr.Write(rawFindings)
 			_, _ = os.Stderr.Write([]byte("\n"))
 			os.Exit(2)
@@ -91,7 +100,7 @@ func main() {
 		fatal(fmt.Errorf("unknown format %q", format))
 	}
 
-	raw, err := json.MarshalIndent(payload, "", "  ")
+	raw, err := jsonx.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		fatal(err)
 	}
@@ -119,6 +128,22 @@ func main() {
 			fatal(err)
 		}
 	}
+}
+
+func serveIngest(listen string, cfg ingest.Config) error {
+	server := ingest.NewServer(cfg)
+	httpServer := &http.Server{
+		Addr:              listen,
+		Handler:           server.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	fmt.Fprintf(os.Stderr, "agelish-teacher: serving local ingest on http://%s\n", listen)
+	err := httpServer.ListenAndServe()
+	if err == http.ErrServerClosed {
+		return nil
+	}
+	return err
 }
 
 func fatal(err error) {

@@ -32,19 +32,22 @@ This means Scribe is just one importer. A Scribe DB export, a JSONL file from a
 proxy, stdin from another process, or a future hosted collector should all feed
 the same canonical raw HTTP envelope shape before provider-specific parsing.
 
-The current implementation is usable as an offline/CLI middleware:
+The current implementation is usable as both an offline CLI middleware and a
+local HTTP ingest relay:
 
 - `-raw-envelope` and `-raw-envelope-stdin` accept canonical raw HTTP envelope
   JSONL.
 - `-raw-provider`, `-raw-request`, and `-raw-response` remain as a single-call
   compatibility wrapper.
+- `-serve` starts a local HTTP server that accepts request/response pairs on
+  `/v1/pairs` and forwards generated OTLP JSON to Langfuse.
 - `-db` reads Scribe's SQLite rows, decodes `raw_payloads`, and routes them
   through the same body-based span builder.
 - `-send` forwards the generated OTLP HTTP/JSON payload to Langfuse.
 
-Planned but not implemented in this binary yet: a long-running HTTP ingest
-server, queue/backpressure controls, and chunk-level streaming updates. Today,
-streaming provider responses are parsed after the captured raw response body is
+The HTTP server is intentionally local-first. It has bounded concurrent workers
+and per-request timeouts, but it does not try to become a cloud collector.
+Streaming provider responses are parsed after the captured raw response body is
 available.
 
 ## Current Scope
@@ -52,6 +55,8 @@ available.
 - Reads Scribe tables: `sessions`, `turns`, `trace_requests`, `raw_payloads`.
 - Reads canonical raw HTTP envelope JSONL from `-raw-envelope` or
   `-raw-envelope-stdin`, without Scribe.
+- Runs a local `/v1/pairs` HTTP ingest endpoint for tools that can tee request
+  and response bodies into Agelish Teacher while they execute.
 - Keeps the older single-pair convenience flags `-raw-provider`, `-raw-request`,
   and `-raw-response`; internally these are wrapped into raw HTTP envelopes.
 - Decodes raw payloads stored as `identity` or `zstd`.
@@ -133,6 +138,53 @@ Raw body pair mode still needs minimal correlation metadata. If
 `-raw-session-id` or `-raw-request-id` are omitted, Agelish Teacher generates
 local fallback IDs. For multi-turn trees, prefer raw envelope mode because it
 can carry session, turn, request, timestamp, URL, header, and status metadata.
+
+## Local HTTP Ingest Mode
+
+Use serve mode when a local proxy, agent launcher, or development tool can send
+Agelish Teacher a copy of each completed request/response pair:
+
+```bash
+export LANGFUSE_BASE_URL=http://localhost:3000
+export LANGFUSE_PUBLIC_KEY=pk-lf-...
+export LANGFUSE_SECRET_KEY=sk-lf-...
+
+go run ./cmd/agelish-teacher \
+  -serve \
+  -listen 127.0.0.1:4319 \
+  -workers 8 \
+  -max-pair-bytes 67108864 \
+  -request-timeout 30s
+```
+
+The main endpoint is `POST /v1/pairs`:
+
+```json
+{
+  "source": "reasonix",
+  "provider": "openai",
+  "session_id": "sess-1",
+  "turn_id": "turn-1",
+  "request_id": "call-1",
+  "request": {
+    "method": "POST",
+    "url": "https://api.example.test/v1/chat/completions",
+    "headers": {"content-type": "application/json"},
+    "body_text": "{\"model\":\"deepseek-v4-pro\",\"messages\":[{\"role\":\"user\",\"content\":\"Say ok.\"}]}",
+    "timestamp_ms": 1710000000200
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {"content-type": "application/json"},
+    "body_text": "{\"model\":\"deepseek-v4-pro\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}",
+    "timestamp_ms": 1710000001200
+  }
+}
+```
+
+`GET /health` returns liveness. `GET /stats` returns accepted, sent, failed,
+in-flight, and last-error counters. Sensitive request headers such as
+`authorization`, `cookie`, and `x-api-key` are redacted before span generation.
 
 ## Send To Langfuse
 
