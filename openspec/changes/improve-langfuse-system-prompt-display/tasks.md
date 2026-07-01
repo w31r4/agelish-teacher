@@ -21,4 +21,4 @@
 - [x] 4.2 Run `go test ./...`.
 - [x] 4.3 Validate the OpenSpec change.
 - [x] 4.4 Re-export the real Codex goal session with `-check-standard`.
-- [ ] 4.5 Send the re-exported trace to local Langfuse and verify via the Langfuse API that later generation display inputs no longer contain system prompts.
+- [x] 4.5 Send the re-exported trace to local Langfuse and verify via the Langfuse API that later generation display inputs no longer contain system prompts.

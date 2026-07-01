@@ -6,7 +6,7 @@ Agelish also needs a durable agent instruction that every Langfuse/OTel mapping 
 
 ## What Changes
 
-- Make `langfuse.observation.input` suppress repeated system prompt messages after the first generation in a session.
+- Make `langfuse.observation.input` suppress repeated system/developer prompt messages after the first generation in a session.
 - Preserve system prompts in metadata-style attributes such as `gen_ai.system_instructions` for every generation where they are present.
 - Keep forensic fields such as `gen_ai.input.messages` complete so raw OTel evidence is not lost.
 - Add an Agelish `.agent` rule requiring real Scribe trace re-export, `-check-standard`, Langfuse send, and Langfuse API verification after every OTel/Langfuse mapping update.
