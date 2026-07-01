@@ -1,11 +1,19 @@
 # Agelish Teacher
 
-Agelish Teacher is a standalone Go binary that reads Scribe's SQLite trace
-database and projects completed LLM calls into OpenTelemetry GenAI spans for
-Langfuse's OTLP HTTP endpoint.
+Agelish Teacher is a standalone Go binary that translates raw LLM provider HTTP
+traffic into OpenTelemetry GenAI spans for OTLP endpoints such as Langfuse.
 
-The converter is intentionally outside Scribe. Scribe keeps faithful wire
-capture; this repo owns the experimental OTel GenAI mapping churn.
+The core is a raw-body translator: given the request/response bodies of a
+provider HTTP call (Anthropic Messages, OpenAI/Codex Responses — JSON or SSE),
+it projects them into `gen_ai.*` spans and attributes. In principle any captured
+HTTP raw body from a supported provider can be fed through this mapping; it is
+not tied to Scribe. Scribe's SQLite trace database is simply the current
+ingestion source — it supplies the raw bodies (plus session/turn structure) that
+the translator consumes.
+
+The converter is intentionally decoupled from any single capture tool. Scribe
+keeps faithful wire capture; this repo owns the experimental OTel GenAI mapping
+churn and can be pointed at other raw-body sources over time.
 
 ## Current Scope
 
