@@ -216,6 +216,7 @@ func exportSession(ctx context.Context, db *sql.DB, session sessionRow) ([]otel.
 			"langfuse.session.id":       session.ID,
 			"gen_ai.conversation.id":    session.ID,
 			"langfuse.observation.type": "span",
+			"langfuse.trace.name":       rootName,
 		}
 		if turnPayloads.Input != nil {
 			turnAttrs["langfuse.observation.input"] = turnPayloads.Input
@@ -589,13 +590,7 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 	if nameModel == "" || nameModel == "unknown" {
 		nameModel = parsedResponse.Model
 	}
-	name := strings.TrimSpace(response.Provider + " " + nameModel)
-	if name == "" {
-		name = "gen_ai.client"
-	}
-	if role != "" && role != "primary" {
-		name = strings.TrimSpace(role + " " + name)
-	}
+	name := generationObservationName(response.Provider, nameModel, role)
 
 	var spans []otel.Span
 	if shouldCreateAgentSpan(role, fineRole) {
@@ -681,7 +676,7 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 			TraceID:       traceID,
 			SpanID:        otel.DeriveSpanID("tool:" + response.ID + ":" + toolID),
 			ParentSpanID:  spanID,
-			Name:          "execute_tool " + call.Name,
+			Name:          toolObservationName(call.Name),
 			Kind:          "SPAN_KIND_INTERNAL",
 			StartUnixNano: span.StartUnixNano,
 			EndUnixNano:   span.EndUnixNano,
@@ -690,6 +685,57 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 		})
 	}
 	return spans, nil
+}
+
+func generationObservationName(provider string, model string, role string) string {
+	name := strings.TrimSpace(provider + " " + model)
+	if strings.EqualFold(provider, "codex") {
+		name = strings.TrimSpace("Codex " + model)
+	}
+	if name == "" {
+		name = "gen_ai.client"
+	}
+	if role != "" && role != "primary" {
+		name = strings.TrimSpace(roleDisplayName(role) + " " + name)
+	}
+	return name
+}
+
+func toolObservationName(name string) string {
+	switch name {
+	case "exec_command", "shell", "local_shell", "local_shell_call":
+		return "Shell command"
+	case "apply_patch":
+		return "Apply patch"
+	case "write_stdin":
+		return "Write stdin"
+	case "read_mcp_resource":
+		return "Read MCP resource"
+	case "list_mcp_resources":
+		return "List MCP resources"
+	case "list_mcp_resource_templates":
+		return "List MCP resource templates"
+	default:
+		if strings.TrimSpace(name) == "" {
+			return "Tool"
+		}
+		return "Tool " + name
+	}
+}
+
+func roleDisplayName(role string) string {
+	switch role {
+	case "subagent":
+		return "Subagent"
+	case "assistive":
+		return "Assistive"
+	case "auxiliary":
+		return "Auxiliary"
+	case "probe":
+		return "Probe"
+	default:
+		return role
+	}
 }
 
 func parseSummary(raw string) map[string]any {
@@ -837,12 +883,12 @@ func controlOutputPayload(response traceRequestRow, summaries []map[string]any) 
 
 func controlObservationName(summaries []map[string]any) string {
 	if controlKind := summaryString(summaries, "control_kind"); controlKind != "" {
-		return "codex " + controlKind
+		return humanizeIdentifier(controlKind)
 	}
 	if path := summaryString(summaries, "path"); path != "" {
-		return "codex control " + path
+		return "Codex control " + path
 	}
-	return "codex control"
+	return "Codex control"
 }
 
 func shouldCreateAgentSpan(role string, fineRole string) bool {
@@ -869,14 +915,28 @@ func responseStatus(response traceRequestRow) otel.Status {
 func agentObservationName(role string, fineRole string) string {
 	switch {
 	case role != "" && fineRole != "":
-		return role + " " + fineRole
+		return roleDisplayName(role) + " " + humanizeIdentifier(fineRole)
 	case role != "":
-		return role
+		return roleDisplayName(role)
 	case fineRole != "":
-		return fineRole
+		return humanizeIdentifier(fineRole)
 	default:
 		return "agent"
 	}
+}
+
+func humanizeIdentifier(value string) string {
+	words := strings.Fields(strings.NewReplacer("_", " ", "-", " ").Replace(value))
+	for i, word := range words {
+		if strings.EqualFold(word, "codex") {
+			words[i] = "Codex"
+			continue
+		}
+		if i == 0 && word != "" {
+			words[i] = strings.ToUpper(word[:1]) + word[1:]
+		}
+	}
+	return strings.Join(words, " ")
 }
 
 func rawPayload(ctx context.Context, db *sql.DB, traceRequestID string) ([]byte, error) {

@@ -110,6 +110,60 @@ func TestExporterNamesClaudeCodeSessionAndTurnSpans(t *testing.T) {
 	if turn.Name != "Claude Code - Turn 2" {
 		t.Fatalf("turn name mismatch: %q", turn.Name)
 	}
+	assertAttr(t, turn.Attributes, "langfuse.trace.name", "Claude Code - Session 019f1caec3ab")
+}
+
+func TestExporterNamesCodexObservationsForLangfuseTree(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "traces.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	createScribeSchema(t, db)
+
+	insertSession(t, db, "019f1d000000777788889999aaaabbbb", "codex", 1710000000000, 1710000006000)
+	insertTurn(t, db, "turn_codex_3", "019f1d000000777788889999aaaabbbb", 3, "completed", 1710000000100, 1710000005000)
+	insertTraceRequest(t, db, traceRow{
+		ID: "req_codex_1", SessionID: "019f1d000000777788889999aaaabbbb", TurnID: "turn_codex_3", RequestID: "call_codex_1",
+		Direction: "request", Provider: "codex", Model: "gpt-5-codex", Timestamp: 1710000000200,
+	})
+	insertTraceRequest(t, db, traceRow{
+		ID: "resp_codex_1", SessionID: "019f1d000000777788889999aaaabbbb", TurnID: "turn_codex_3", RequestID: "call_codex_1",
+		Direction: "response", Provider: "codex", Model: "gpt-5-codex", Timestamp: 1710000001200,
+		Outcome: "ok", HTTPStatus: 200, StopReason: "requires_action", ToolCallCount: 1,
+	})
+	insertRawPayload(t, db, "raw_req_codex_1", "req_codex_1", "identity", []byte(`{"input":"Print pwd."}`))
+	insertRawPayload(t, db, "raw_resp_codex_1", "resp_codex_1", "identity", []byte(`{"model":"gpt-5-codex","status":"requires_action","output":[{"type":"function_call","call_id":"call_exec_1","name":"exec_command","arguments":{"cmd":"pwd"}}]}`))
+
+	result, err := Export(context.Background(), Options{DBPath: dbPath})
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+
+	session := findSpanByAttr(t, result.Spans, "scribe.session.id", "019f1d000000777788889999aaaabbbb")
+	if session.Name != "Codex - Session 019f1d000000" {
+		t.Fatalf("session name mismatch: %q", session.Name)
+	}
+	assertAttr(t, session.Attributes, "langfuse.trace.name", "Codex - Session 019f1d000000")
+
+	turn := findSpanByAttr(t, result.Spans, "scribe.turn.id", "turn_codex_3")
+	if turn.Name != "Codex - Turn 3" {
+		t.Fatalf("turn name mismatch: %q", turn.Name)
+	}
+	assertAttr(t, turn.Attributes, "langfuse.trace.name", "Codex - Session 019f1d000000")
+
+	generation := findSpanByAttr(t, result.Spans, "langfuse.observation.type", "generation")
+	if generation.Name != "Codex gpt-5-codex" {
+		t.Fatalf("generation name mismatch: %q", generation.Name)
+	}
+	assertAttr(t, generation.Attributes, "gen_ai.provider.name", "codex")
+
+	tool := findSpanByAttr(t, result.Spans, "gen_ai.tool.call.id", "call_exec_1")
+	if tool.Name != "Shell command" {
+		t.Fatalf("tool name mismatch: %q", tool.Name)
+	}
+	assertAttr(t, tool.Attributes, "gen_ai.tool.name", "exec_command")
 }
 
 func TestExporterAddsLangfuseInputOutputAndToolResultOutput(t *testing.T) {
@@ -264,6 +318,9 @@ func TestExporterMapsCodexModelProbeToControlSpanNotGeneration(t *testing.T) {
 		"langfuse.observation.type": "span",
 		"scribe.trace_request.id":   "resp_probe",
 	})
+	if control.Name != "Codex model probe" {
+		t.Fatalf("control name mismatch: %q", control.Name)
+	}
 	if control.Kind != "SPAN_KIND_INTERNAL" {
 		t.Fatalf("control span kind mismatch: %s", control.Kind)
 	}
@@ -357,7 +414,7 @@ func TestExporterWrapsSubagentGenerationInAgentObservation(t *testing.T) {
 	}
 
 	agent := findSpanByAttr(t, result.Spans, "langfuse.observation.type", "agent")
-	if agent.Name != "subagent codex_subagent" {
+	if agent.Name != "Subagent Codex subagent" {
 		t.Fatalf("agent name mismatch: %q", agent.Name)
 	}
 	assertAttr(t, agent.Attributes, "scribe.request_role", "subagent")
@@ -371,7 +428,7 @@ func TestExporterWrapsSubagentGenerationInAgentObservation(t *testing.T) {
 	if generation.ParentSpanID != agent.SpanID {
 		t.Fatalf("generation parent mismatch: got %s want %s", generation.ParentSpanID, agent.SpanID)
 	}
-	if generation.Name != "subagent codex gpt-5-codex" {
+	if generation.Name != "Subagent Codex gpt-5-codex" {
 		t.Fatalf("generation name mismatch: %q", generation.Name)
 	}
 	assertAttr(t, generation.Attributes, "scribe.request_role", "subagent")
