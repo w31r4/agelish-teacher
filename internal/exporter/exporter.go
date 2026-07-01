@@ -775,8 +775,9 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 		includeSystemInDisplay = *generationIndex == 0
 		*generationIndex = *generationIndex + 1
 	}
+	displayProvider := generationProviderName(response.Provider, summaries)
 	attrs := map[string]any{
-		"gen_ai.provider.name":       response.Provider,
+		"gen_ai.provider.name":       displayProvider,
 		"gen_ai.operation.name":      "chat",
 		"gen_ai.conversation.id":     sessionID,
 		"session.id":                 sessionID,
@@ -786,6 +787,7 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 		"langfuse.observation.level": langfuseLevel(response.Outcome),
 		"scribe.trace_request.id":    response.ID,
 		"scribe.request_id":          response.RequestID,
+		"scribe.provider.name":       response.Provider,
 	}
 	addScribeSummaryAttributes(attrs, summaries)
 	addInternalContextAttributes(attrs, parsedRequest.InternalContexts)
@@ -842,7 +844,7 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 	if nameModel == "" || nameModel == "unknown" {
 		nameModel = parsedResponse.Model
 	}
-	name := generationObservationName(response.Provider, nameModel, role)
+	name := generationDisplayName(displayProvider, nameModel, role, summaries)
 
 	var spans []otel.Span
 	if shouldCreateAgentSpan(role, fineRole) {
@@ -959,6 +961,23 @@ func generationObservationName(provider string, model string, role string) strin
 		name = strings.TrimSpace(roleDisplayName(role) + " " + name)
 	}
 	return name
+}
+
+func generationProviderName(fallback string, summaries []map[string]any) string {
+	if platform := summaryString(summaries, "platform"); platform != "" {
+		return platform
+	}
+	return fallback
+}
+
+func generationDisplayName(provider string, model string, role string, summaries []map[string]any) string {
+	if operationName := summaryString(summaries, "operation_name"); operationName != "" {
+		if role != "" && role != "primary" {
+			return strings.TrimSpace(roleDisplayName(role) + " " + operationName)
+		}
+		return operationName
+	}
+	return generationObservationName(provider, model, role)
 }
 
 func toolObservationName(name string) string {
@@ -1083,6 +1102,9 @@ func addScribeSummaryAttributes(attrs map[string]any, summaries []map[string]any
 		"scribe.agent.subagent_kind":                {"subagent_kind"},
 		"scribe.phase":                              {"phase"},
 		"scribe.path":                               {"path"},
+		"scribe.platform":                           {"platform"},
+		"scribe.protocol":                           {"protocol"},
+		"scribe.operation.name":                     {"operation_name"},
 		"scribe.codex.thread_id":                    {"codex_thread_id"},
 		"scribe.codex.session_id":                   {"codex_session_id"},
 		"scribe.codex.turn_id":                      {"codex_turn_id"},
