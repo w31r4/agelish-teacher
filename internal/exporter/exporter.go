@@ -30,6 +30,17 @@ type Result struct {
 	Spans []otel.Span `json:"spans"`
 }
 
+type RawPairOptions struct {
+	Provider     string
+	Source       string
+	SessionID    string
+	RequestID    string
+	RequestBody  []byte
+	ResponseBody []byte
+	StartedAt    time.Time
+	EndedAt      time.Time
+}
+
 type sessionRow struct {
 	ID        string
 	Source    string
@@ -101,6 +112,216 @@ func Export(ctx context.Context, opts Options) (Result, error) {
 		result.Spans = append(result.Spans, sessionSpans...)
 	}
 	return result, nil
+}
+
+func ExportRawPair(opts RawPairOptions) (Result, error) {
+	providerName := strings.TrimSpace(opts.Provider)
+	if providerName == "" {
+		return Result{}, fmt.Errorf("raw provider is required")
+	}
+	source := strings.TrimSpace(opts.Source)
+	if source == "" {
+		source = providerName
+	}
+	sessionID := strings.TrimSpace(opts.SessionID)
+	if sessionID == "" {
+		sessionID = "raw_" + providerName
+	}
+	requestID := strings.TrimSpace(opts.RequestID)
+	if requestID == "" {
+		requestID = "raw_request"
+	}
+	startedAt := opts.StartedAt
+	if startedAt.IsZero() {
+		startedAt = time.Now().UTC()
+	}
+	endedAt := opts.EndedAt
+	if endedAt.IsZero() || endedAt.Before(startedAt) {
+		endedAt = startedAt
+	}
+	startMS := startedAt.UnixMilli()
+	endMS := endedAt.UnixMilli()
+
+	parsedRequest, _ := provider.ParseRequest(providerName, opts.RequestBody)
+	parsedResponse, _ := provider.ParseResponse(providerName, opts.ResponseBody)
+	toolResultsByID := map[string]provider.ToolResult{}
+	for _, result := range parsedRequest.ToolResults {
+		if result.ID != "" {
+			toolResultsByID[result.ID] = result
+		}
+	}
+
+	traceID := otel.DeriveTraceID("raw-session:" + sessionID)
+	rootSpanID := otel.DeriveSpanID("raw-session:" + sessionID)
+	turnSpanID := otel.DeriveSpanID("raw-turn:" + sessionID + ":1")
+	rawSession := sessionRow{ID: sessionID, Source: source}
+	rootName := sessionSpanName(rawSession)
+	rootAttrs := map[string]any{
+		"scribe.session.id":         sessionID,
+		"scribe.source":             source,
+		"gen_ai.conversation.id":    sessionID,
+		"session.id":                sessionID,
+		"langfuse.session.id":       sessionID,
+		"langfuse.observation.type": "span",
+		"langfuse.trace.name":       rootName,
+		"agelish.input.kind":        "raw_http_body",
+	}
+	turnAttrs := map[string]any{
+		"scribe.turn.id":            "raw_turn_1",
+		"scribe.turn.number":        int64(1),
+		"scribe.turn.status":        "completed",
+		"session.id":                sessionID,
+		"langfuse.session.id":       sessionID,
+		"gen_ai.conversation.id":    sessionID,
+		"langfuse.observation.type": "span",
+		"langfuse.trace.name":       rootName,
+		"agelish.input.kind":        "raw_http_body",
+	}
+	if len(parsedRequest.InputMessages) > 0 {
+		rootAttrs["langfuse.trace.input"] = parsedRequest.InputMessages
+		rootAttrs["langfuse.observation.input"] = parsedRequest.InputMessages
+		turnAttrs["langfuse.observation.input"] = parsedRequest.InputMessages
+	}
+	if len(parsedResponse.OutputMessages) > 0 {
+		rootAttrs["langfuse.trace.output"] = parsedResponse.OutputMessages
+		rootAttrs["langfuse.observation.output"] = parsedResponse.OutputMessages
+		turnAttrs["langfuse.observation.output"] = parsedResponse.OutputMessages
+	}
+
+	spans := []otel.Span{
+		{
+			TraceID:       traceID,
+			SpanID:        rootSpanID,
+			Name:          rootName,
+			Kind:          "SPAN_KIND_INTERNAL",
+			StartUnixNano: msToNs(startMS),
+			EndUnixNano:   msToNs(endMS),
+			Attributes:    rootAttrs,
+		},
+		{
+			TraceID:       traceID,
+			SpanID:        turnSpanID,
+			ParentSpanID:  rootSpanID,
+			Name:          turnSpanName(source, 1),
+			Kind:          "SPAN_KIND_INTERNAL",
+			StartUnixNano: msToNs(startMS),
+			EndUnixNano:   msToNs(endMS),
+			Attributes:    turnAttrs,
+		},
+	}
+
+	attrs := map[string]any{
+		"gen_ai.provider.name":       providerName,
+		"gen_ai.operation.name":      "chat",
+		"gen_ai.conversation.id":     sessionID,
+		"session.id":                 sessionID,
+		"langfuse.session.id":        sessionID,
+		"langfuse.observation.type":  "generation",
+		"langfuse.observation.level": "DEFAULT",
+		"langfuse.trace.name":        rootName,
+		"scribe.trace_request.id":    requestID,
+		"scribe.request_id":          requestID,
+		"agelish.input.kind":         "raw_http_body",
+	}
+	addInternalContextAttributes(attrs, parsedRequest.InternalContexts)
+	if parsedRequest.Model != "" {
+		attrs["gen_ai.request.model"] = parsedRequest.Model
+	}
+	if parsedResponse.Model != "" {
+		attrs["gen_ai.response.model"] = parsedResponse.Model
+	}
+	setIntAttr(attrs, "gen_ai.usage.input_tokens", sql.NullInt64{}, parsedResponse.Usage.InputTokens)
+	setIntAttr(attrs, "gen_ai.usage.output_tokens", sql.NullInt64{}, parsedResponse.Usage.OutputTokens)
+	setIntAttr(attrs, "gen_ai.usage.cache_read.input_tokens", sql.NullInt64{}, parsedResponse.Usage.CacheReadTokens)
+	setIntAttr(attrs, "gen_ai.usage.cache_creation.input_tokens", sql.NullInt64{}, parsedResponse.Usage.CacheCreationTokens)
+	setIntAttr(attrs, "gen_ai.usage.reasoning.output_tokens", sql.NullInt64{}, parsedResponse.Usage.ReasoningTokens)
+	setIntAttr(attrs, "gen_ai.request.max_tokens", sql.NullInt64{}, parsedRequest.MaxTokens)
+	if len(parsedResponse.FinishReasons) > 0 {
+		attrs["gen_ai.response.finish_reasons"] = parsedResponse.FinishReasons
+	}
+	if len(parsedRequest.SystemInstructions) > 0 {
+		attrs["gen_ai.system_instructions"] = mustJSON(parsedRequest.SystemInstructions)
+	}
+	if len(parsedRequest.InputMessages) > 0 {
+		attrs["gen_ai.input.messages"] = mustJSON(parsedRequest.InputMessages)
+		attrs["gen_ai.prompt"] = mustJSON(parsedRequest.InputMessages)
+		attrs["langfuse.observation.input"] = parsedRequest.InputMessages
+	}
+	if len(parsedResponse.OutputMessages) > 0 {
+		attrs["gen_ai.output.messages"] = mustJSON(parsedResponse.OutputMessages)
+		attrs["gen_ai.completion"] = mustJSON(parsedResponse.OutputMessages)
+		attrs["langfuse.observation.output"] = parsedResponse.OutputMessages
+	}
+
+	nameModel := parsedResponse.Model
+	if nameModel == "" {
+		nameModel = parsedRequest.Model
+	}
+	generationSpanID := otel.DeriveSpanID("raw-generation:" + sessionID + ":" + requestID)
+	spans = append(spans, otel.Span{
+		TraceID:       traceID,
+		SpanID:        generationSpanID,
+		ParentSpanID:  turnSpanID,
+		Name:          generationObservationName(providerName, nameModel, ""),
+		Kind:          "SPAN_KIND_CLIENT",
+		StartUnixNano: msToNs(startMS),
+		EndUnixNano:   msToNs(endMS),
+		Attributes:    attrs,
+		Status:        otel.Status{Code: "STATUS_CODE_OK"},
+	})
+
+	for index, call := range parsedResponse.ToolCalls {
+		toolID := call.ID
+		if toolID == "" {
+			toolID = fmt.Sprintf("%s:%d", requestID, index)
+		}
+		toolName := toolObservationName(call.Name)
+		toolAttrs := map[string]any{
+			"gen_ai.operation.name":     "execute_tool",
+			"gen_ai.tool.name":          call.Name,
+			"gen_ai.tool.call.id":       toolID,
+			"session.id":                sessionID,
+			"langfuse.session.id":       sessionID,
+			"langfuse.observation.type": "tool",
+			"langfuse.trace.name":       rootName,
+			"scribe.trace_request.id":   requestID,
+			"agelish.input.kind":        "raw_http_body",
+		}
+		if call.Name != "" {
+			toolAttrs["scribe.tool.name"] = call.Name
+		}
+		if call.Namespace != "" {
+			toolAttrs["gen_ai.tool.namespace"] = call.Namespace
+		}
+		if call.Arguments != nil {
+			toolAttrs["gen_ai.tool.call.arguments"] = mustJSON(call.Arguments)
+			toolAttrs["langfuse.observation.input"] = call.Arguments
+		}
+		if result, ok := toolResultsByID[call.ID]; ok {
+			toolAttrs["scribe.tool.result.status"] = "matched"
+			toolAttrs["gen_ai.tool.call.result"] = result.Output
+			toolAttrs["langfuse.observation.output"] = result.Output
+		} else {
+			toolAttrs["scribe.tool.result.status"] = "missing"
+			toolAttrs["langfuse.observation.output"] = map[string]any{
+				"status": "missing_tool_result",
+				"reason": "no matching tool result was provided in the raw request body",
+			}
+		}
+		spans = append(spans, otel.Span{
+			TraceID:       traceID,
+			SpanID:        otel.DeriveSpanID("raw-tool:" + sessionID + ":" + requestID + ":" + toolID),
+			ParentSpanID:  generationSpanID,
+			Name:          toolName,
+			Kind:          "SPAN_KIND_INTERNAL",
+			StartUnixNano: msToNs(startMS),
+			EndUnixNano:   msToNs(endMS),
+			Attributes:    toolAttrs,
+			Status:        otel.Status{Code: "STATUS_CODE_OK"},
+		})
+	}
+
+	return Result{Spans: spans}, nil
 }
 
 func resolveDBPath(dbPath string) (string, error) {
@@ -246,7 +467,7 @@ func exportSession(ctx context.Context, db *sql.DB, session sessionRow) ([]otel.
 				continue
 			}
 			paired := requestByRequestID[tr.RequestID]
-			observationSpans, err := buildObservationSpans(ctx, db, traceID, turnSpanID, session.ID, tr, paired, turnPayloads.ToolResultsByID)
+			observationSpans, err := buildObservationSpans(ctx, db, traceID, turnSpanID, session.ID, rootName, tr, paired, turnPayloads.ToolResultsByID)
 			if err != nil {
 				return nil, err
 			}
@@ -467,7 +688,7 @@ func traceColumn(columns map[string]bool, name string, fallback string) string {
 	return fallback + " AS " + name
 }
 
-func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turnSpanID string, sessionID string, response traceRequestRow, request traceRequestRow, toolResultsByID map[string]provider.ToolResult) ([]otel.Span, error) {
+func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turnSpanID string, sessionID string, traceName string, response traceRequestRow, request traceRequestRow, toolResultsByID map[string]provider.ToolResult) ([]otel.Span, error) {
 	responseBody, err := rawPayload(ctx, db, response.ID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
@@ -507,6 +728,7 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 			"session.id":                 sessionID,
 			"langfuse.session.id":        sessionID,
 			"langfuse.observation.type":  "span",
+			"langfuse.trace.name":        traceName,
 			"langfuse.observation.level": langfuseLevel(response.Outcome),
 		}
 		addScribeSummaryAttributes(attrs, summaries)
@@ -536,11 +758,13 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 		"session.id":                 sessionID,
 		"langfuse.session.id":        sessionID,
 		"langfuse.observation.type":  "generation",
+		"langfuse.trace.name":        traceName,
 		"langfuse.observation.level": langfuseLevel(response.Outcome),
 		"scribe.trace_request.id":    response.ID,
 		"scribe.request_id":          response.RequestID,
 	}
 	addScribeSummaryAttributes(attrs, summaries)
+	addInternalContextAttributes(attrs, parsedRequest.InternalContexts)
 	if response.RequestedModel.Valid && response.RequestedModel.String != "" {
 		attrs["gen_ai.request.model"] = response.RequestedModel.String
 	} else if request.Model != "" {
@@ -601,11 +825,13 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 			"session.id":                 sessionID,
 			"langfuse.session.id":        sessionID,
 			"langfuse.observation.type":  "agent",
+			"langfuse.trace.name":        traceName,
 			"langfuse.observation.level": langfuseLevel(response.Outcome),
 			"scribe.trace_request.id":    response.ID,
 			"scribe.request_id":          response.RequestID,
 		}
 		addScribeSummaryAttributes(agentAttrs, summaries)
+		addInternalContextAttributes(agentAttrs, parsedRequest.InternalContexts)
 		if len(parsedRequest.InputMessages) > 0 {
 			agentAttrs["langfuse.observation.input"] = parsedRequest.InputMessages
 		}
@@ -644,6 +870,7 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 		if toolID == "" {
 			toolID = fmt.Sprintf("%s:%d", response.ID, index)
 		}
+		toolName := toolObservationName(call.Name)
 		toolAttrs := map[string]any{
 			"gen_ai.operation.name":     "execute_tool",
 			"gen_ai.tool.name":          call.Name,
@@ -651,7 +878,11 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 			"session.id":                sessionID,
 			"langfuse.session.id":       sessionID,
 			"langfuse.observation.type": "tool",
+			"langfuse.trace.name":       traceName,
 			"scribe.trace_request.id":   response.ID,
+		}
+		if call.Name != "" {
+			toolAttrs["scribe.tool.name"] = call.Name
 		}
 		addScribeSummaryAttributes(toolAttrs, summaries)
 		if call.Namespace != "" {
@@ -676,7 +907,7 @@ func buildObservationSpans(ctx context.Context, db *sql.DB, traceID string, turn
 			TraceID:       traceID,
 			SpanID:        otel.DeriveSpanID("tool:" + response.ID + ":" + toolID),
 			ParentSpanID:  spanID,
-			Name:          toolObservationName(call.Name),
+			Name:          toolName,
 			Kind:          "SPAN_KIND_INTERNAL",
 			StartUnixNano: span.StartUnixNano,
 			EndUnixNano:   span.EndUnixNano,
@@ -719,7 +950,7 @@ func toolObservationName(name string) string {
 		if strings.TrimSpace(name) == "" {
 			return "Tool"
 		}
-		return "Tool " + name
+		return name
 	}
 }
 
@@ -841,6 +1072,29 @@ func addScribeSummaryAttributes(attrs map[string]any, summaries []map[string]any
 	}
 	if modelCount, ok := summaryInt64(summaries, "model_count"); ok {
 		attrs["scribe.model_count"] = modelCount
+	}
+}
+
+func addInternalContextAttributes(attrs map[string]any, contexts []provider.InternalContext) {
+	if len(contexts) == 0 {
+		return
+	}
+	var sources []string
+	seenSources := map[string]bool{}
+	for _, context := range contexts {
+		if context.Source != "" && !seenSources[context.Source] {
+			sources = append(sources, context.Source)
+			seenSources[context.Source] = true
+		}
+		if context.Source == "goal" {
+			attrs["scribe.codex.goal.present"] = true
+			if context.Objective != "" {
+				attrs["scribe.codex.goal.objective"] = context.Objective
+			}
+		}
+	}
+	if len(sources) > 0 {
+		attrs["scribe.codex.internal_context.sources"] = sources
 	}
 }
 
