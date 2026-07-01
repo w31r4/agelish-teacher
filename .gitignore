@@ -1,0 +1,9 @@
+.env
+/agelish-teacher
+*.db
+*.sqlite
+*.sqlite3
+*.out
+dist/
+tmp/
+.playwright-cli/
